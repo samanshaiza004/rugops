@@ -2,16 +2,42 @@ package narrative
 
 import "core:strings"
 
-compile :: proc(source: string, registry: Registry) -> Compilation {
+ACTION_OUTCOMES :: [4]Action_Outcome{.Accepted, .Refused, .Interrupted, .Deferred}
+
+action_outcome_mask :: proc(action: Action_Definition) -> u8 {
+	mask := u8(1) << u8(Action_Outcome.Accepted)
+	if action.can_refuse { mask |= u8(1) << u8(Action_Outcome.Refused) }
+	if action.can_interrupt { mask |= u8(1) << u8(Action_Outcome.Interrupted) }
+	if action.can_defer { mask |= u8(1) << u8(Action_Outcome.Deferred) }
+	return mask
+}
+
+compile :: proc(source: string, registry: Registry, metadata: Program_Metadata = {}) -> Compilation {
 	result := Compilation{}
 	result.program.source = make([]u8, len(source))
 	copy(result.program.source, transmute([]u8)source)
 	owned_source := string(result.program.source)
+	program_id := metadata.id
+	if program_id == "" { program_id = "anonymous" }
+	program_version := metadata.version
+	if program_version == 0 { program_version = 1 }
+	result.program.identity_id_storage = make([]u8, len(program_id))
+	copy(result.program.identity_id_storage, transmute([]u8)program_id)
+	source_digest := source_hash(owned_source)
+	result.program.identity = Program_Identity{
+		id = string(result.program.identity_id_storage),
+		version = program_version,
+		source_hash = source_digest,
+		identity_hash = identity_hash(program_id, program_version, source_digest),
+	}
+	validate_registry(&result, registry)
+	copy_query_schema(&result, registry)
 	lines, _ := strings.split_lines(owned_source, context.temp_allocator)
 	current_scene := -1
 	choice_node := -1
 	current_choice := -1
 	choice_condition := ""
+	choice_condition_index := -1
 	choice_condition_not := false
 	branch_stack: [dynamic]int
 	branch_else_jumps: [dynamic]int
@@ -37,6 +63,7 @@ compile :: proc(source: string, registry: Registry) -> Compilation {
 			current_scene = len(result.program.scenes)-1
 			choice_node, current_choice = -1, -1
 			choice_condition = ""
+			choice_condition_index = -1
 			choice_condition_not = false
 			continue
 		}
@@ -58,6 +85,7 @@ compile :: proc(source: string, registry: Registry) -> Compilation {
 			choice_node = len(result.program.nodes)-1
 			current_choice = -1
 			choice_condition = ""
+			choice_condition_index = -1
 			choice_condition_not = false
 			continue
 		}
@@ -69,10 +97,12 @@ compile :: proc(source: string, registry: Registry) -> Compilation {
 			choice := Choice{
 				label = strings.trim_space(line[2:]),
 				condition = choice_condition,
+				condition_index = choice_condition_index,
 				condition_not = choice_condition_not,
 				target_scene = -1,
 				target_pc = -1,
 				line = line_no,
+				outcome_start = len(result.program.outcome_routes),
 			}
 			append(&result.program.choices, choice)
 			current_choice = len(result.program.choices)-1
@@ -81,15 +111,14 @@ compile :: proc(source: string, registry: Registry) -> Compilation {
 		}
 		if strings.has_prefix(line, "@if ") {
 			condition := strings.trim_space(line[4:])
-			if !registry_has_condition(registry, condition) {
-				diagnose(&result, .Unknown_Condition, line_no, indent+5, condition)
-			}
+			condition_index, _ := compile_query(&result, registry, condition, line_no, indent+5)
 			if choice_node >= 0 && indent > 0 {
 				choice_condition = condition
+				choice_condition_index = condition_index
 				choice_condition_not = false
 				continue
 			}
-			branch := Node{kind = .Branch, condition = condition, branch_true = len(result.program.nodes)+1, branch_false = -1, line = line_no}
+			branch := Node{kind = .Branch, condition = condition, condition_index = condition_index, branch_true = len(result.program.nodes)+1, branch_false = -1, line = line_no}
 			append(&result.program.nodes, branch)
 			append(&branch_stack, len(result.program.nodes)-1)
 			append(&branch_else_jumps, -1)
@@ -120,6 +149,7 @@ compile :: proc(source: string, registry: Registry) -> Compilation {
 		if line == "@endif" {
 			if choice_node >= 0 && indent > 0 {
 				choice_condition = ""
+				choice_condition_index = -1
 				choice_condition_not = false
 				continue
 			}
@@ -169,14 +199,36 @@ compile :: proc(source: string, registry: Registry) -> Compilation {
 			}
 			continue
 		}
-		if strings.has_prefix(line, "@intent ") {
+		if strings.has_prefix(line, "@attempt ") || strings.has_prefix(line, "@intent ") {
 			if current_choice < 0 {
-				diagnose(&result, .Syntax, line_no, indent+1, "@intent must follow a choice option")
+				diagnose(&result, .Syntax, line_no, indent+1, "@attempt must follow a choice option")
 			} else {
-				action := strings.trim_space(line[8:])
+				prefix_length := 9
+				if strings.has_prefix(line, "@intent ") { prefix_length = 8 }
+				action := strings.trim_space(line[prefix_length:])
 				result.program.choices[current_choice].action = action
-				if !registry_has_action(registry, action) {
+				if _, found := registry_action(registry, action); !found {
 					diagnose(&result, .Unknown_Action, line_no, indent+9, action)
+				}
+			}
+			continue
+		}
+		if strings.has_prefix(line, "@on ") {
+			if current_choice < 0 {
+				diagnose(&result, .Syntax, line_no, indent+1, "@on must follow a choice option")
+			} else if route, ok := parse_outcome_route(line[4:], line_no); !ok {
+				diagnose(&result, .Syntax, line_no, indent+1, "expected @on outcome -> target")
+			} else {
+				choice := &result.program.choices[current_choice]
+				duplicate := false
+				for existing in result.program.outcome_routes[choice.outcome_start:] {
+					if existing.outcome == route.outcome { duplicate = true; break }
+				}
+				if duplicate {
+					diagnose(&result, .Duplicate_Outcome_Route, line_no, indent+1, action_outcome_name(route.outcome))
+				} else {
+					append(&result.program.outcome_routes, route)
+					choice.outcome_count += 1
 				}
 			}
 			continue
@@ -221,21 +273,50 @@ compile :: proc(source: string, registry: Registry) -> Compilation {
 	if len(result.program.scenes) == 0 {
 		diagnose(&result, .Syntax, 1, 1, "story must declare at least one scene")
 	}
-	resolve_targets(&result)
+	resolve_targets(&result, registry)
 	build_edges(&result.program)
 	validate_reachability(&result)
 	return result
 }
 
-resolve_targets :: proc(result: ^Compilation) {
+copy_query_schema :: proc(result: ^Compilation, registry: Registry) {
+	for field in registry.fields {
+		owned_field := field
+		owned_field.id = own_query_string(result, field.id)
+		owned_field.enum_type = own_query_string(result, field.enum_type)
+		owned_field.enum_values = make([]string, len(field.enum_values), context.allocator)
+		for i in 0..<len(field.enum_values) {
+			owned_field.enum_values[i] = own_query_string(result, field.enum_values[i])
+		}
+		owned_field.reads = make([]string, len(field.reads), context.allocator)
+		for i in 0..<len(field.reads) {
+			owned_field.reads[i] = own_query_string(result, field.reads[i])
+		}
+		append(&result.program.query_fields, owned_field)
+	}
+}
+
+resolve_targets :: proc(result: ^Compilation, registry: Registry) {
 	if len(result.program.scenes) == 0 { return }
 	result.program.entry_scene = 0
 	for i in 0..<len(result.program.choices) {
 		choice := &result.program.choices[i]
 		if choice.action == "" { diagnose(result, .Missing_Action, choice.line, 1, choice.label) }
-		if choice.target == "" { diagnose(result, .Unknown_Target, choice.line, 1, "choice missing -> target"); continue }
-		choice.target_scene, choice.target_pc = resolve_reference(&result.program, choice.target)
-		if choice.target_scene < 0 { diagnose(result, .Unknown_Target, choice.line, 1, choice.target) }
+		if choice.target == "" {
+			diagnose(result, .Unknown_Target, choice.line, 1, "choice missing accepted -> target")
+		} else {
+			choice.target_scene, choice.target_pc = resolve_reference(&result.program, choice.target)
+			if choice.target_scene < 0 { diagnose(result, .Unknown_Target, choice.line, 1, choice.target) }
+		}
+		if action, known := registry_action(registry, choice.action); known {
+			choice.action_outcomes = action_outcome_mask(action)
+			validate_action_routes(result, choice, action)
+		}
+		for route_index in choice.outcome_start..<choice.outcome_start+choice.outcome_count {
+			route := &result.program.outcome_routes[route_index]
+			route.target_scene, route.target_pc = resolve_reference(&result.program, route.target)
+			if route.target_scene < 0 { diagnose(result, .Unknown_Target, route.line, 1, route.target) }
+		}
 	}
 	for i in 0..<len(result.program.nodes) {
 		node := &result.program.nodes[i]
@@ -249,6 +330,45 @@ resolve_targets :: proc(result: ^Compilation) {
 			diagnose(result, .Syntax, 1, 1, "checkpoint anchors must be choices")
 		}
 	}
+}
+
+validate_action_routes :: proc(result: ^Compilation, choice: ^Choice, action: Action_Definition) {
+	for route in result.program.outcome_routes[choice.outcome_start:choice.outcome_start+choice.outcome_count] {
+		if route.outcome == .Accepted || !action_supports_outcome(action, route.outcome) {
+			diagnose(result, .Unexpected_Outcome_Route, route.line, 1, action_outcome_name(route.outcome))
+		}
+	}
+	for outcome in ACTION_OUTCOMES {
+		if outcome == .Accepted || !action_supports_outcome(action, outcome) { continue }
+		if !choice_has_route(result.program, choice, outcome) {
+			diagnose(result, .Missing_Outcome_Route, choice.line, 1, action.id)
+		}
+	}
+}
+
+choice_has_route :: proc(program: Program, choice: ^Choice, outcome: Action_Outcome) -> bool {
+	for route in program.outcome_routes[choice.outcome_start:choice.outcome_start+choice.outcome_count] {
+		if route.outcome == outcome { return true }
+	}
+	return false
+}
+
+action_supports_outcome :: proc(action: Action_Definition, outcome: Action_Outcome) -> bool {
+	switch outcome {
+	case .Invalid: return false
+	case .Accepted: return true
+	case .Refused: return action.can_refuse
+	case .Interrupted: return action.can_interrupt
+	case .Deferred: return action.can_defer
+	}
+	return false
+}
+
+registry_action :: proc(registry: Registry, id: string) -> (action: Action_Definition, found: bool) {
+	for candidate in registry.actions {
+		if candidate.id == id { return candidate, true }
+	}
+	return {}, false
 }
 
 resolve_reference :: proc(program: ^Program, reference: string) -> (scene, pc: int) {
@@ -294,6 +414,12 @@ build_edges :: proc(program: ^Program) {
 						if source_anchor != "" { append_edge(program, source_anchor, choice.anchor_id, "choice") }
 						target_anchor := referenced_anchor(program, choice.target_scene, choice.target_pc)
 						if target_anchor != "" { append_edge(program, choice.anchor_id, target_anchor, "consequence") }
+						for route in program.outcome_routes[choice.outcome_start:choice.outcome_start+choice.outcome_count] {
+							route_anchor := referenced_anchor(program, route.target_scene, route.target_pc)
+							if route_anchor != "" {
+								append_edge(program, choice.anchor_id, route_anchor, outcome_edge_name(route.outcome))
+							}
+						}
 					}
 				}
 			} else if node.kind == .Jump && node.target_scene >= 0 && node.jump_target != "" {
@@ -352,6 +478,9 @@ validate_reachability :: proc(result: ^Compilation) {
 				if node.kind == .Choice_Group {
 					for option in result.program.choices[node.choice_start:node.choice_start+node.choice_count] {
 						if option.target_scene >= 0 && !reachable[option.target_scene] { reachable[option.target_scene] = true; changed = true }
+						for route in result.program.outcome_routes[option.outcome_start:option.outcome_start+option.outcome_count] {
+							if route.target_scene >= 0 && !reachable[route.target_scene] { reachable[route.target_scene] = true; changed = true }
+						}
 					}
 				}
 			}
@@ -363,7 +492,73 @@ validate_reachability :: proc(result: ^Compilation) {
 }
 
 diagnose :: proc(result: ^Compilation, code: Diagnostic_Code, line, column: int, token: string) {
-	append(&result.diagnostics, Diagnostic{code = code, line = line, column = column, token = token})
+	owned_token := own_diagnostic_string(result, token)
+	append(&result.diagnostics, Diagnostic{code = code, line = line, column = column, token = owned_token})
+}
+
+own_diagnostic_string :: proc(result: ^Compilation, value: string) -> string {
+	if value == "" { return "" }
+	bytes := make([]u8, len(value), context.allocator)
+	copy(bytes, transmute([]u8)value)
+	append(&result.diagnostic_string_storage, bytes)
+	return string(bytes)
+}
+
+own_query_string :: proc(result: ^Compilation, value: string) -> string {
+	if value == "" { return "" }
+	bytes := make([]u8, len(value), context.allocator)
+	copy(bytes, transmute([]u8)value)
+	append(&result.program.query_string_storage, bytes)
+	return string(bytes)
+}
+
+validate_registry :: proc(result: ^Compilation, registry: Registry) {
+	for i in 0..<len(registry.actions) {
+		action := registry.actions[i]
+		if !valid_id(action.id) { diagnose(result, .Invalid_ID, 1, 1, action.id) }
+		for previous in registry.actions[:i] {
+			if previous.id == action.id { diagnose(result, .Duplicate_Action, 1, 1, action.id) }
+		}
+	}
+	for i in 0..<len(registry.fields) {
+		field := registry.fields[i]
+		if !valid_id(field.id) {
+			diagnose(result, .Invalid_Field_Definition, 1, 1, field.id)
+			continue
+		}
+		for previous in registry.fields[:i] {
+			if previous.id == field.id { diagnose(result, .Duplicate_Field, 1, 1, field.id) }
+		}
+		if field.type == .Invalid || (field.opaque && field.type != .Boolean) {
+			diagnose(result, .Invalid_Field_Definition, 1, 1, field.id)
+		}
+		if field.type == .Enumeration {
+			if field.enum_type == "" || len(field.enum_values) == 0 {
+				diagnose(result, .Invalid_Field_Definition, 1, 1, field.id)
+			}
+			for enum_index in 0..<len(field.enum_values) {
+				value := field.enum_values[enum_index]
+				if !valid_id(value) { diagnose(result, .Invalid_Field_Definition, 1, 1, value) }
+				for previous in field.enum_values[:enum_index] {
+					if previous == value { diagnose(result, .Invalid_Field_Definition, 1, 1, value) }
+				}
+			}
+		} else if field.enum_type != "" || len(field.enum_values) != 0 {
+			diagnose(result, .Invalid_Field_Definition, 1, 1, field.id)
+		}
+		for dependency in field.reads {
+			if _, found := registry_field(registry, dependency); !found {
+				diagnose(result, .Unknown_Field, 1, 1, dependency)
+			}
+		}
+	}
+}
+
+registry_field :: proc(registry: Registry, id: string) -> (field: Field_Definition, found: bool) {
+	for candidate in registry.fields {
+		if candidate.id == id { return candidate, true }
+	}
+	return {}, false
 }
 
 registry_has_speaker :: proc(registry: Registry, value: string) -> bool {
@@ -371,14 +566,49 @@ registry_has_speaker :: proc(registry: Registry, value: string) -> bool {
 	return false
 }
 
-registry_has_action :: proc(registry: Registry, value: string) -> bool {
-	for candidate in registry.actions { if candidate == value { return true } }
-	return false
+parse_outcome_route :: proc(value: string, line: int) -> (route: Choice_Outcome_Route, ok: bool) {
+	s := strings.trim_space(value)
+	arrow := index_of(s, "->")
+	if arrow < 0 { return {}, false }
+	name := strings.trim_space(s[:arrow])
+	route.outcome, ok = parse_action_outcome(name)
+	if !ok { return {}, false }
+	route.target = strings.trim_space(s[arrow+2:])
+	route.target_scene, route.target_pc = -1, -1
+	route.line = line
+	return route, route.target != ""
 }
 
-registry_has_condition :: proc(registry: Registry, value: string) -> bool {
-	for candidate in registry.conditions { if candidate == value { return true } }
-	return false
+parse_action_outcome :: proc(name: string) -> (outcome: Action_Outcome, ok: bool) {
+	switch name {
+	case "accepted": return .Accepted, true
+	case "refused": return .Refused, true
+	case "interrupted": return .Interrupted, true
+	case "deferred": return .Deferred, true
+	}
+	return .Invalid, false
+}
+
+action_outcome_name :: proc(outcome: Action_Outcome) -> string {
+	switch outcome {
+	case .Invalid: return "invalid"
+	case .Accepted: return "accepted"
+	case .Refused: return "refused"
+	case .Interrupted: return "interrupted"
+	case .Deferred: return "deferred"
+	}
+	return "unknown"
+}
+
+outcome_edge_name :: proc(outcome: Action_Outcome) -> string {
+	switch outcome {
+	case .Invalid: return "outcome_invalid"
+	case .Accepted: return "outcome_accepted"
+	case .Refused: return "outcome_refused"
+	case .Interrupted: return "outcome_interrupted"
+	case .Deferred: return "outcome_deferred"
+	}
+	return "outcome_unknown"
 }
 
 indentation :: proc(line: string) -> int {
@@ -442,4 +672,19 @@ index_of :: proc(value, needle: string) -> int {
 		if value[i:i+len(needle)] == needle { return i }
 	}
 	return -1
+}
+
+source_hash :: proc(source: string) -> u64 {
+	hash: u64 = 14695981039346656037
+	for byte in source {
+		hash = (hash~u64(byte))*1099511628211
+	}
+	return hash
+}
+
+identity_hash :: proc(program_id: string, version: u32, source_digest: u64) -> u64 {
+	hash := source_hash(program_id)
+	for shift in 0..<4 { hash = (hash~u64((version >> u32(shift*8))&0xff))*1099511628211 }
+	for shift in 0..<8 { hash = (hash~u64((source_digest >> u32(shift*8))&0xff))*1099511628211 }
+	return hash
 }

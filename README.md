@@ -4,7 +4,7 @@ Rugops is an experimental, Odin-first game foundation built around explicit stat
 
 The engine is intentionally small: `core/` supplies a deterministic integer clock, stable scheduled-event queue, and generic command-history records. `examples/unobserved/game/` owns the game's world, rules, observations, and versioned save format. `examples/unobserved/main/` translates keyboard and mouse input to game commands and renders observations with raylib. No raylib package is imported by the core or the narrative simulation.
 
-`narrative/` is an optional, renderer-independent library for compiling readable dialogue scripts and executing their directed control flow. It does not depend on `core/`, raylib, or a game model. Games provide pure condition queries and receive scene/anchor events; they keep action outcomes, world state, and narrative-map meaning in game code.
+`narrative/` is an optional, renderer-independent library for compiling readable dialogue scripts and executing their directed control flow. It does not depend on `core/`, raylib, or a game model. Games declare typed fields and actions; they keep world state, action consequences, and narrative-map meaning in game code.
 
 ## Requirements
 
@@ -56,12 +56,13 @@ observation := unobserved.observe(&world)
 
 ## Optional narrative library
 
-`rugops:narrative` compiles `.stalga`-style source to an indexed `Program`. Authored scene IDs and anchors are stable identities; ordinary dialogue is sequential and has no manually assigned line IDs or next-line pointers. The game supplies a `Registry` of known speakers, actions, and conditions so the compiler can diagnose misspelled symbols and invalid targets.
+`rugops:narrative` compiles Rugops Script source to an indexed `Program`. `.rgps` is the canonical source extension; `.stalga` remains a valid input alias because the compiler consumes source text and does not infer language semantics from a filename. Authored scene IDs and anchors are stable identities; ordinary dialogue is sequential and has no manually assigned line IDs or next-line pointers. A game registers speaker names, typed action definitions, and typed query fields so the compiler can diagnose misspelled symbols, invalid conditions, and missing outcome routes.
 
 ```odin
 import narrative "rugops:narrative"
 
-compiled := narrative.compile(script_text, game.narrative_symbols())
+compiled := narrative.compile(script_text, game.narrative_symbols(),
+	narrative.Program_Metadata{id = "my_game.chapter_01", version = 1})
 defer narrative.destroy_compilation(&compiled)
 if narrative.has_errors(&compiled) {
 	// Report compiled.diagnostics and stop before starting a session.
@@ -69,17 +70,28 @@ if narrative.has_errors(&compiled) {
 
 state := narrative.new_state(&compiled.program)
 for {
-	err := narrative.advance(&compiled.program, &state, game_context,
-		game.query_condition, game.on_narrative_event)
-	if err != .None || state.ended { break }
-	// Render or inspect the node at state.cursor. Continue with
-	// narrative.continue_dialogue, or resolve a visible choice in game code.
+	runtime_error, query_error := narrative.advance(&compiled.program, &state, game_context,
+		game.resolve_query_field, game.on_narrative_event)
+	if runtime_error != .None || query_error != .None || state.ended { break }
+	// Render or inspect the node at state.cursor. Dialogue can continue
+	// without advancing fictional time.
+}
+
+// The UI retains a program-scoped offer handle from the observation.
+index, visible, query_error := narrative.visible_choice(&compiled.program, &state,
+	0, game_context, game.resolve_query_field)
+offer, has_offer := narrative.choice_id(&compiled.program, index)
+if visible && query_error == .None && has_offer {
+submission := narrative.submit_choice(&compiled.program, &state, offer,
+	game_context, game.resolve_query_field, game.resolve_action)
 }
 ```
 
-`advance` resolves branches, jumps, anchors, and end instructions until it reaches dialogue, narration, or a choice group. Its condition callback is read-only; its event callback reports scene entries and reached anchors. `visible_choice` maps a player-visible option index to the compiled choice. After the game validates and commits the named action, `commit_choice` moves the narrative cursor. The runtime does not advance logical time by itself.
+Conditions are a small Boolean expression language with `and`, `or`, `not`, parentheses, integer comparisons, and registered enum comparisons. For example, `@if masha.has_page and player.bond >= 3`. Fields resolve through a read-only callback; unknown fields and resolver failures are reported as errors, never converted to false. Registered opaque Boolean predicates can be referenced with `opaque:predicate_name`; their declared field dependencies remain inspectable, but their internals are not symbolically analyzable. `explain_query` reports the evaluated subexpressions and any failing field. Call `destroy_query_explanation` when finished with its owned step list.
 
-The compiled program owns its source buffer, and its strings refer into that buffer. Keep the `Compilation` alive for as long as its `Program` or runtime state is in use. Runtime instruction positions are compile-local; store stable scene/anchor IDs in saves and resolve them with `cursor_at_anchor` after recompilation. Structural program changes may still require a game-authored save migration.
+`advance` resolves branches, jumps, anchors, and end instructions until it reaches dialogue, narration, or a choice group. `visible_choice` maps a player-visible option ordinal to its current compiled choice. `submit_choice` accepts the program-scoped handle captured from that observation, rechecks eligibility, validates all declared continuations, invokes the game-owned action resolver, and advances the narrative cursor according to its typed outcome. Actions can declare accepted, refused, interrupted, or deferred results; every declared non-accepted outcome needs an explicit `@on` continuation. The game resolver validates before mutating and returns an explicit action error for an invalid command. The narrative runtime does not advance logical time by itself.
+
+The compiled program owns its source buffer and query schema, and its source-authored strings refer into that buffer. Keep the `Compilation` alive for as long as its `Program` or runtime state is in use. `Program_Metadata` gives the compiled program an author-defined ID and version; the program also exposes a source hash and identity hash for save compatibility checks and diagnostics. These hashes do not migrate runtime positions. Runtime instruction positions are compile-local; store stable scene/anchor IDs in saves and resolve them with `cursor_at_anchor` after recompilation. Structural program changes may still require a deliberate game-authored migration; never guess when a saved position cannot be mapped safely.
 
 ## Save compatibility
 

@@ -12,6 +12,138 @@ Anchor_Kind :: enum u8 {
 	Event,
 }
 
+Query_Type :: enum u8 {
+	Invalid,
+	Boolean,
+	Integer,
+	Enumeration,
+}
+
+Query_Operator :: enum u8 {
+	Field,
+	Opaque_Field,
+	Boolean_Literal,
+	Integer_Literal,
+	Enumeration_Literal,
+	Not,
+	And,
+	Or,
+	Equal,
+	Not_Equal,
+	Less,
+	Less_Equal,
+	Greater,
+	Greater_Equal,
+}
+
+Query_Error :: enum u8 {
+	None,
+	Invalid_Expression,
+	Unknown_Field,
+	Resolver_Failed,
+	Type_Mismatch,
+}
+
+Query_Value :: struct {
+	type:         Query_Type,
+	boolean:      bool,
+	integer:      i64,
+	enum_type:    string,
+	enum_value:   string,
+}
+
+Query_Node :: struct {
+	operator:      Query_Operator,
+	type:          Query_Type,
+	field_id:      string,
+	enum_type:     string,
+	enum_value:    string,
+	boolean:       bool,
+	integer:       i64,
+	left:          int,
+	right:         int,
+	line:          int,
+	column:        int,
+}
+
+Query_Expression :: struct {
+	source: string,
+	root:   int,
+	line:   int,
+}
+
+Query_Evaluation_Step :: struct {
+	node_index: int,
+	operator:   Query_Operator,
+	field_id:   string,
+	failed_field: string,
+	value:      Query_Value,
+	error:      Query_Error,
+}
+
+Query_Explanation :: struct {
+	expression:  string,
+	value:       bool,
+	error:       Query_Error,
+	failed_field: string,
+	steps:       [dynamic]Query_Evaluation_Step,
+}
+
+Action_Outcome :: enum u8 {
+	Invalid,
+	Accepted,
+	Refused,
+	Interrupted,
+	Deferred,
+}
+
+Action_Definition :: struct {
+	id:              string,
+	can_refuse:      bool,
+	can_interrupt:   bool,
+	can_defer:       bool,
+}
+
+Action_Error :: enum u8 {
+	None,
+	Invalid_Command,
+}
+
+Action_Execution :: struct {
+	error:   Action_Error,
+	outcome: Action_Outcome,
+}
+
+Action_Resolver :: #type proc(user_data: rawptr, choice: ^Choice) -> Action_Execution
+
+Choice_ID :: struct {
+	program_hash: u64,
+	index:        u32,
+}
+
+Field_Definition :: struct {
+	id:          string,
+	type:        Query_Type,
+	enum_type:   string,
+	enum_values: []string,
+	opaque:      bool,
+	reads:       []string,
+}
+
+Field_Resolver :: #type proc(user_data: rawptr, field_id: string) -> (Query_Value, Query_Error)
+
+Program_Metadata :: struct {
+	id:      string,
+	version: u32,
+}
+
+Program_Identity :: struct {
+	id:          string,
+	version:     u32,
+	source_hash: u64,
+	identity_hash: u64,
+}
+
 Node_Kind :: enum u8 {
 	Dialogue,
 	Narration,
@@ -35,6 +167,7 @@ Node :: struct {
 	speaker:       string,
 	text:          string,
 	condition:     string,
+	condition_index: int,
 	branch_true:   int,
 	branch_false:  int,
 	jump_target:   string,
@@ -52,11 +185,23 @@ Choice :: struct {
 	action:          string,
 	target:          string,
 	condition:       string,
+	condition_index: int,
 	condition_not:   bool,
 	anchor_id:       string,
 	target_scene:    int,
 	target_pc:       int,
 	line:            int,
+	outcome_start:   int,
+	outcome_count:   int,
+	action_outcomes: u8,
+}
+
+Choice_Outcome_Route :: struct {
+	outcome:       Action_Outcome,
+	target:        string,
+	target_scene:  int,
+	target_pc:     int,
+	line:          int,
 }
 
 Anchor :: struct {
@@ -79,18 +224,25 @@ Edge :: struct {
 
 Program :: struct {
 	source:  []u8,
+	identity: Program_Identity,
+	identity_id_storage: []u8,
+	query_string_storage: [dynamic][]u8,
+	query_fields: [dynamic]Field_Definition,
 	scenes:  [dynamic]Scene,
 	nodes:   [dynamic]Node,
 	choices: [dynamic]Choice,
+	outcome_routes: [dynamic]Choice_Outcome_Route,
 	anchors: [dynamic]Anchor,
 	edges:   [dynamic]Edge,
+	query_nodes: [dynamic]Query_Node,
+	queries: [dynamic]Query_Expression,
 	entry_scene: int,
 }
 
 Registry :: struct {
 	speakers:   []string,
-	actions:    []string,
-	conditions: []string,
+	actions:    []Action_Definition,
+	fields:     []Field_Definition,
 }
 
 Diagnostic_Code :: enum u8 {
@@ -101,8 +253,17 @@ Diagnostic_Code :: enum u8 {
 	Unknown_Speaker,
 	Unknown_Action,
 	Unknown_Condition,
+	Unknown_Field,
+	Invalid_Query,
+	Query_Type_Mismatch,
+	Invalid_Field_Definition,
+	Duplicate_Field,
+	Duplicate_Action,
 	Unknown_Target,
 	Missing_Action,
+	Missing_Outcome_Route,
+	Unexpected_Outcome_Route,
+	Duplicate_Outcome_Route,
 	Unreachable_Scene,
 }
 
@@ -114,8 +275,9 @@ Diagnostic :: struct {
 }
 
 Compilation :: struct {
-	program:     Program,
-	diagnostics: [dynamic]Diagnostic,
+	program:                   Program,
+	diagnostics:               [dynamic]Diagnostic,
+	diagnostic_string_storage: [dynamic][]u8,
 }
 
 Cursor :: struct {
@@ -127,16 +289,29 @@ Cursor :: struct {
 
 destroy_program :: proc(program: ^Program) {
 	delete(program.source)
+	delete(program.identity_id_storage)
+	for value in program.query_string_storage { delete(value) }
+	delete(program.query_string_storage)
+	for field in program.query_fields {
+		delete(field.enum_values)
+		delete(field.reads)
+	}
+	delete(program.query_fields)
 	delete(program.scenes)
 	delete(program.nodes)
 	delete(program.choices)
+	delete(program.outcome_routes)
 	delete(program.anchors)
 	delete(program.edges)
+	delete(program.query_nodes)
+	delete(program.queries)
 	program^ = {}
 }
 
 destroy_compilation :: proc(compilation: ^Compilation) {
 	destroy_program(&compilation.program)
+	for value in compilation.diagnostic_string_storage { delete(value) }
+	delete(compilation.diagnostic_string_storage)
 	delete(compilation.diagnostics)
 	compilation^ = {}
 }
