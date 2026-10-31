@@ -5,6 +5,13 @@ package rugops_core
 Event_ID :: u32
 Tick :: u64
 
+Timeline_Error :: enum {
+	None,
+	Tick_In_Past,
+	Target_In_Past,
+	Order_Overflow,
+}
+
 Scheduled_Event :: struct {
 	tick:  Tick,
 	order: u64,
@@ -18,8 +25,15 @@ Timeline :: struct {
 	pending:    [dynamic]Scheduled_Event,
 }
 
-// Schedule inserts an event in deterministic (tick, insertion-order) order.
-schedule :: proc(t: ^Timeline, tick: Tick, id: Event_ID, value: i64 = 0) {
+// schedule inserts an event in deterministic (tick, insertion-order) order.
+// Events earlier than the current logical time are rejected.
+schedule :: proc(t: ^Timeline, tick: Tick, id: Event_ID, value: i64 = 0) -> Timeline_Error {
+	if tick < t.now {
+		return .Tick_In_Past
+	}
+	if t.next_order == max(u64) {
+		return .Order_Overflow
+	}
 	event := Scheduled_Event{tick = tick, order = t.next_order, id = id, value = value}
 	t.next_order += 1
 	append(&t.pending, event)
@@ -34,25 +48,26 @@ schedule :: proc(t: ^Timeline, tick: Tick, id: Event_ID, value: i64 = 0) {
 		i -= 1
 	}
 	t.pending[i] = event
+	return .None
 }
 
-// advance moves logical time forward and returns all events due by the target.
-// The returned events keep their stable ordering and are removed from pending.
-advance :: proc(t: ^Timeline, delta: Tick) -> [dynamic]Scheduled_Event {
-	target := t.now + delta
-	due: [dynamic]Scheduled_Event
-	for event in t.pending {
-		if event.tick > target {
-			break
-		}
-		append(&due, event)
+// advance_to processes at most one event due by target. It moves now to that
+// event's tick before returning it, so the caller can handle the event and
+// schedule consequences relative to the correct time. Call again with the
+// same target until has_event is false; the final call moves now to target.
+advance_to :: proc(t: ^Timeline, target: Tick) -> (event: Scheduled_Event, has_event: bool, err: Timeline_Error) {
+	if target < t.now {
+		return {}, false, .Target_In_Past
 	}
-	if len(due) > 0 {
-		copy(t.pending[:], t.pending[len(due):])
-		resize(&t.pending, len(t.pending)-len(due))
+	if len(t.pending) > 0 && t.pending[0].tick <= target {
+		event = t.pending[0]
+		copy(t.pending[:], t.pending[1:])
+		resize(&t.pending, len(t.pending)-1)
+		t.now = event.tick
+		return event, true, .None
 	}
 	t.now = target
-	return due
+	return {}, false, .None
 }
 
 // Command_Record is the compact deterministic history entry used by games.

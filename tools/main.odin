@@ -98,22 +98,11 @@ main :: proc() {
 		original, ok := run_scenario(invite)
 		if !ok { os.exit(1) }
 		replayed, replay_ok := game.replay(original.history.items[:])
-		before := inspect(&original)
-		after := inspect(&replayed)
-		equal := before.tick == after.tick && before.current_location == after.current_location &&
-			before.active_speaker == after.active_speaker && before.active_dialogue == after.active_dialogue &&
-			before.character_state == after.character_state && before.command_history == after.command_history &&
-			before.ended == after.ended && len(before.available_choices) == len(after.available_choices)
-		if equal {
-			for i in 0..<len(before.available_choices) {
-				if before.available_choices[i] != after.available_choices[i] { equal = false; break }
-			}
-		}
-		if !replay_ok || !equal {
-			fmt.eprintln("replay did not reproduce the same observation")
+		if !replay_ok || !game.same_authoritative_state(&original, &replayed) {
+			fmt.eprintln("replay did not reproduce the same authoritative state")
 			os.exit(1)
 		}
-		print_json(after)
+		print_json(inspect(&replayed))
 	case:
 		fmt.eprintln("unknown command: ", command)
 		os.exit(2)

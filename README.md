@@ -12,6 +12,8 @@ The engine is intentionally small: `core/` supplies a deterministic integer cloc
 
 The repository is configured as an Odin collection named `rugops`. Build scripts pass `-collection:rugops=.`.
 
+On Windows, `scripts/build.sh` writes `build/the_unobserved.exe`; `scripts/run.sh` starts that executable. On macOS and Linux, both scripts use `build/the_unobserved`.
+
 ## Build, run, and test
 
 From the repository root:
@@ -48,11 +50,11 @@ observation := unobserved.observe(&world)
 // observation.choices can be turned into UI, CLI, or agent actions.
 ```
 
-`submit` returns an error for invalid commands and changes no state in that case. Reading dialogue never advances time. The two explicit station choices advance to tick 12; the later trip to Ren advances to tick 20. The scheduled tick-10 and tick-12 events run in stable insertion order while the player is at the river.
+`submit` returns an error for invalid commands and changes no state in that case. Reading dialogue never advances time. The two explicit station choices advance to tick 12; the later trip to Ren advances to tick 20. The tick-10 handler schedules Ren's tick-12 arrival while it runs; `core.advance_to` returns one due event at its own timestamp, allowing the game to handle it and schedule consequences before advancing farther. Calls repeat through the requested target, with stable insertion order for events sharing a timestamp. Scheduling an event earlier than the current logical tick is rejected.
 
 ## Save compatibility
 
-Saves are JSON snapshots with a top-level `version` and the complete authoritative `world`, including the logical clock, pending events, stable-order counter, game flags, dialogue position, and command history. Version 1 is the initial experimental format. No compatibility promise is made between versions; a game should reject unsupported versions and migrate deliberately when its state schema changes.
+Saves are JSON snapshots with a top-level `version` and the complete authoritative `world`, including the logical clock, pending events, stable-order counter, game flags, dialogue position, and command history. Version 2 is the current format after the causal scheduler change; version 1 saves are rejected. Loading validates the snapshot by replaying its command history and comparing all authoritative fields, including pending events. No compatibility promise is made between versions; a game should reject unsupported versions and migrate deliberately when its state schema changes.
 
 Audio is an external host side effect. Loading a save does not issue gameplay audio commands or replay past sounds; the native host starts its music once and plays a short sound only in response to successful player input.
 
@@ -72,7 +74,7 @@ The background and portrait illustrations were generated for this example and th
 
 ## Validation and limitations
 
-The first milestone was built and exercised on macOS arm64 with Odin's bundled raylib 6.0. Headless tests cover event ordering, command replay, offscreen events, dialogue/time separation, save/load, and invalid commands. Native asset loading fails with a nonzero exit when a required asset is missing or invalid.
+The first milestone was built and exercised on macOS arm64 with Odin's bundled raylib 6.0. Headless tests cover stable event ordering, nested scheduling and large-step equivalence, event-past rejection, complete-state replay, offscreen events, dialogue/time separation, save/load validation, and invalid commands. Native asset loading fails with a nonzero exit when a required asset is missing or invalid.
 
 Windows and Linux builds, WebAssembly, hot reload, and graphical testing on those platforms remain future validation targets. The narrative is deliberately fixed and small; there is no editor, general scene system, ECS, physics, or scripting language.
 

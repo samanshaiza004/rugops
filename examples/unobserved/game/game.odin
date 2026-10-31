@@ -6,7 +6,7 @@ import "core:encoding/json"
 import "core:os"
 import core "rugops:core"
 
-SAVE_VERSION :: 1
+SAVE_VERSION :: 2
 
 Location :: enum u32 { Station, River, Ren_Workshop, Home }
 Command_Kind :: enum u32 { Advance_Dialogue, Invite_Hana, Leave_Without_Invitation, Visit_Ren, Go_Home }
@@ -60,8 +60,7 @@ Save_Error :: enum { None, Read_Failed, Write_Failed, Invalid_Data, Unsupported_
 
 new_world :: proc() -> World {
 	w := World{location = .Station}
-	core.schedule(&w.timeline, 10, EVENT_HANA_DEPARTS)
-	core.schedule(&w.timeline, 12, EVENT_REN_ARRIVES)
+	assert(core.schedule(&w.timeline, 10, EVENT_HANA_DEPARTS) == .None)
 	return w
 }
 
@@ -114,26 +113,34 @@ submit :: proc(w: ^World, command: Command) -> Submit_Error {
 }
 
 advance_time :: proc(w: ^World, delta: core.Tick) {
-	due := core.advance(&w.timeline, delta)
-	defer delete(due)
-	for event in due {
-		switch Event_Kind(event.id) {
-		case EVENT_HANA_DEPARTS:
-			if w.hana_invited {
-				w.hana_waiting = true
-			} else {
-				w.hana_departed = true
-			}
-		case EVENT_REN_ARRIVES:
-			if w.hana_waiting {
-				w.letter_delivered = true
-			} else {
-				w.letter_kept = true
-			}
-		case:
-			// Unknown event IDs are ignored so a newer save can be inspected
-			// safely by older gameplay code, while its version remains explicit.
+	target := w.timeline.now + delta
+	for {
+		event, has_event, err := core.advance_to(&w.timeline, target)
+		if err != .None { return }
+		if !has_event { break }
+		handle_event(w, event)
+	}
+}
+
+handle_event :: proc(w: ^World, event: core.Scheduled_Event) {
+	switch Event_Kind(event.id) {
+	case EVENT_HANA_DEPARTS:
+		if w.hana_invited {
+			w.hana_waiting = true
+		} else {
+			w.hana_departed = true
 		}
+		// Ren's arrival is a consequence of this event, scheduled from its
+		// logical time so a large advance still processes it at tick 12.
+		assert(core.schedule(&w.timeline, w.timeline.now+2, EVENT_REN_ARRIVES) == .None)
+	case EVENT_REN_ARRIVES:
+		if w.hana_waiting {
+			w.letter_delivered = true
+		} else {
+			w.letter_kept = true
+		}
+	case:
+		// Unknown event IDs are ignored. Save versions remain explicit.
 	}
 }
 
@@ -141,13 +148,45 @@ replay :: proc(commands: []core.Command_Record) -> (w: World, ok: bool) {
 	w = new_world()
 	for record in commands {
 		if record.kind > u32(max(Command_Kind)) {
+			destroy_world(&w)
 			return new_world(), false
 		}
 		if submit(&w, Command{kind = Command_Kind(record.kind)}) != .None {
+			destroy_world(&w)
 			return new_world(), false
 		}
 	}
 	return w, true
+}
+
+// same_authoritative_state compares all game-owned state, including pending
+// events and command history. Allocator capacity and slice addresses are not
+// part of the state contract.
+same_authoritative_state :: proc(a, b: ^World) -> bool {
+	if a.timeline.now != b.timeline.now || a.timeline.next_order != b.timeline.next_order ||
+		a.location != b.location || a.dialogue_node != b.dialogue_node ||
+		a.hana_invited != b.hana_invited || a.hana_waiting != b.hana_waiting ||
+		a.hana_departed != b.hana_departed || a.letter_delivered != b.letter_delivered ||
+		a.letter_kept != b.letter_kept || a.ended != b.ended ||
+		len(a.timeline.pending) != len(b.timeline.pending) ||
+		len(a.history.items) != len(b.history.items) {
+		return false
+	}
+	for i in 0..<len(a.timeline.pending) {
+		if a.timeline.pending[i] != b.timeline.pending[i] { return false }
+	}
+	for i in 0..<len(a.history.items) {
+		if a.history.items[i] != b.history.items[i] { return false }
+	}
+	return true
+}
+
+// validate_world confirms that the snapshot matches a deterministic replay
+// of its own recorded commands.
+validate_world :: proc(w: ^World) -> bool {
+	replayed, ok := replay(w.history.items[:])
+	defer destroy_world(&replayed)
+	return ok && same_authoritative_state(w, &replayed)
 }
 
 observe :: proc(w: ^World) -> Observation {
@@ -209,6 +248,7 @@ location_name :: proc(location: Location) -> string {
 }
 
 save :: proc(w: ^World, path: string) -> Save_Error {
+	if !validate_world(w) { return .Invalid_Data }
 	data, err := json.marshal(Save_Data{version = SAVE_VERSION, world = w^})
 	if err != nil { return .Invalid_Data }
 	defer delete(data)
@@ -221,7 +261,17 @@ load :: proc(path: string) -> (w: World, err: Save_Error) {
 	if os_err != os.ERROR_NONE { return new_world(), .Read_Failed }
 	defer delete(data)
 	parsed: Save_Data
-	if json.unmarshal(data, &parsed) != nil { return new_world(), .Invalid_Data }
-	if parsed.version != SAVE_VERSION { return new_world(), .Unsupported_Version }
+	if json.unmarshal(data, &parsed) != nil {
+		destroy_world(&parsed.world)
+		return new_world(), .Invalid_Data
+	}
+	if parsed.version != SAVE_VERSION {
+		destroy_world(&parsed.world)
+		return new_world(), .Unsupported_Version
+	}
+	if !validate_world(&parsed.world) {
+		destroy_world(&parsed.world)
+		return new_world(), .Invalid_Data
+	}
 	return parsed.world, .None
 }
