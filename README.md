@@ -103,6 +103,16 @@ The highest-priority eligible beat wins; equal priorities use ascending beat ID 
 
 `advance` resolves branches, jumps, contextual selections, anchors, and end instructions until it reaches dialogue, narration, or a choice group. `visible_choice` maps a player-visible option ordinal to its current compiled choice. `submit_choice` accepts the program-scoped handle captured from that observation, rechecks eligibility, validates all declared continuations, invokes the game-owned action resolver, and advances the narrative cursor according to its typed outcome. Actions can declare accepted, refused, interrupted, or deferred results; every declared non-accepted outcome needs an explicit `@on` continuation. A game should check that the intended outcome is declared before applying any effects and return errors without mutation. Rugops reports an undeclared outcome but cannot roll back arbitrary game-owned state. The narrative runtime does not advance logical time by itself.
 
+## Bounded state exploration
+
+`rugops:core` includes a deterministic breadth-first explorer for finding real command sequences through a game. The game supplies callbacks to clone and destroy states, enumerate legal commands, apply a command to a clone, test a goal, hash state, and compare future-equivalent state. Commands remain opaque to Rugops and are returned as a witness in the same order used during exploration.
+
+The explorer checks equality after matching hashes, so a hash collision cannot merge different states. Games should exclude command logs and diagnostic traces from state equality unless future game rules read them; any knowledge, pending event, checkpoint, seeded RNG state, or conversation cursor that affects future behavior belongs in the key. Command enumeration must be complete and stable. Set `closed_finite` only when those commands describe a known finite reachable state space.
+
+Results distinguish `Reachable`, `Exhaustively_Unreachable`, and `Not_Found_Within_Budget`. The last result is used when a depth/state/expansion cap cuts off search or when the game has not declared a finite closed space. Coverage reports discovered and expanded states, duplicates, tested commands, and maximum witness depth. BFS returns a shortest-command witness, with ties determined by the game's stable command order.
+
+Em Stalga's `./scripts/headless.sh explore masha_response.distrustful` searches from a new game using the chapter's actual legal choices, prints a JSON witness, then replays that witness and verifies the reached beat. The separate `why` command evaluates a supplied state fixture; it explains eligibility but does not claim the fixture is reachable.
+
 The compiled program owns its source buffer and query schema, and its source-authored strings refer into that buffer. Keep the `Compilation` alive for as long as its `Program` or runtime state is in use. `Program_Metadata` gives the compiled program an author-defined ID and version; the program also exposes a source hash and identity hash for save compatibility checks and diagnostics. These hashes do not migrate runtime positions. Runtime instruction positions are compile-local; store stable scene/anchor IDs in saves and resolve them with `cursor_at_anchor` after recompilation. Structural program changes may still require a deliberate game-authored migration; never guess when a saved position cannot be mapped safely.
 
 The current `State` and `Choice_ID` represent one directed conversation cursor; choice handles include the program identity and compiled choice index, but not a conversation-instance ID or offer revision. Before a world runs multiple active conversations, add those dimensions to the game-owned conversation instance and the choice handle so stale offers from one instance cannot be submitted to another.
@@ -116,7 +126,7 @@ Audio is an external host side effect. Loading a save does not issue gameplay au
 ## Layout
 
 ```text
-core/                         Deterministic logical time and history records
+core/                         Deterministic time, command history, and bounded exploration
 narrative/                    Optional text compiler, indexed IR, and interpreter
 examples/unobserved/game/     Headless world, commands, observations, save/load
 examples/unobserved/main/     Raylib window, input, assets, rendering, audio
@@ -130,7 +140,7 @@ The background and portrait illustrations were generated for this example and th
 
 ## Validation and limitations
 
-The first milestone was built and exercised on macOS arm64 with Odin's bundled raylib 6.0. Headless tests cover stable event ordering, nested scheduling and large-step equivalence, event-past rejection, complete-state replay, offscreen events, dialogue/time separation, save/load validation, and invalid commands. Native asset loading fails with a nonzero exit when a required asset is missing or invalid.
+The first milestone was built and exercised on macOS arm64 with Odin's bundled raylib 6.0. Headless tests cover stable event ordering, nested scheduling and large-step equivalence, event-past rejection, complete-state replay, offscreen events, dialogue/time separation, save/load validation, invalid commands, and shortest-witness exploration with hash collisions and distinct search limits. Native asset loading fails with a nonzero exit when a required asset is missing or invalid.
 
 Windows and Linux builds, WebAssembly, hot reload, and graphical testing on those platforms remain future validation targets. The narrative is deliberately fixed and small; there is no editor, general scene system, ECS, physics, or scripting language.
 
