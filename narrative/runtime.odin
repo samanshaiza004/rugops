@@ -6,6 +6,7 @@ package narrative
 Runtime_Event_Kind :: enum u8 {
 	Scene_Entered,
 	Anchor_Reached,
+	Contextual_Beat_Selected,
 }
 
 Runtime_Event :: struct {
@@ -14,6 +15,8 @@ Runtime_Event :: struct {
 	previous_scene_id:  string,
 	location:           string,
 	anchor_id:          string,
+	pool_id:            string,
+	beat_id:            string,
 	checkpoint:         bool,
 }
 
@@ -58,9 +61,14 @@ choice_id :: proc(program: ^Program, index: int) -> (id: Choice_ID, ok: bool) {
 	return Choice_ID{program_hash = program.identity.identity_hash, index = u32(index)}, true
 }
 
-// advance resolves branches, jumps, and stable anchors until it reaches a
-// dialogue, narration, choice group, or end instruction. A resolver failure
-// is returned explicitly and is never treated as a false predicate.
+choice_declares_outcome :: proc(choice: ^Choice, outcome: Action_Outcome) -> bool {
+	if choice == nil || outcome <= .Invalid || outcome > .Deferred { return false }
+	return choice.action_outcomes&(u8(1)<<u8(outcome)) != 0
+}
+
+// advance resolves branches, jumps, contextual selections, and stable anchors
+// until it reaches a dialogue, narration, choice group, or end instruction.
+// A resolver failure is returned explicitly and is never treated as false.
 advance :: proc(
 	program: ^Program,
 	state: ^State,
@@ -127,12 +135,150 @@ advance :: proc(
 				pc = node.target_pc,
 				anchor_id = state.cursor.anchor_id,
 			}
+		case .Contextual_Select:
+			selection := select_contextual_beat(program, node.contextual_pool_index, user_data, resolve_field)
+			if selection.error == .Query_Evaluation_Failed {
+				return .Query_Evaluation_Failed, selection.query_error
+			}
+			if selection.error != .None { return .Invalid_State, .None }
+			pool := program.contextual_pools[node.contextual_pool_index]
+			beat := program.contextual_beats[selection.beat_index]
+			if handle_event != nil {
+				handle_event(user_data, Runtime_Event{
+					kind = .Contextual_Beat_Selected,
+					scene_id = scene.id,
+					pool_id = pool.id,
+					beat_id = beat.id,
+				})
+			}
+			target := selection.target
+			target.anchor_id = state.cursor.anchor_id
+			state.cursor = target
 		case .End:
 			state.ended = true
 			return .None, .None
 		}
 	}
 	return .Control_Flow_Limit, .None
+}
+
+select_contextual_beat :: proc(
+	program: ^Program,
+	pool_index: int,
+	user_data: rawptr,
+	resolve_field: Field_Resolver,
+) -> Contextual_Selection {
+	result := Contextual_Selection{beat_index = -1}
+	if program == nil || pool_index < 0 || pool_index >= len(program.contextual_pools) {
+		result.error = .Unknown_Pool
+		return result
+	}
+	pool := program.contextual_pools[pool_index]
+	selected := -1
+	for i in pool.beat_start..<pool.beat_start+pool.beat_count {
+		beat := program.contextual_beats[i]
+		if beat.fallback { continue }
+		query := evaluate_condition(program, beat.condition_index, user_data, resolve_field)
+		if query.error != .None {
+			result.error = .Query_Evaluation_Failed
+			result.query_error = query.error
+			return result
+		}
+		if !query.value.boolean { continue }
+		if selected < 0 || contextual_beat_precedes(beat, program.contextual_beats[selected], pool.policy) {
+			selected = i
+		}
+	}
+	if selected < 0 { selected = pool.fallback_beat }
+	if selected < pool.beat_start || selected >= pool.beat_start+pool.beat_count {
+		result.error = .Missing_Fallback
+		return result
+	}
+	beat := program.contextual_beats[selected]
+	if beat.target_scene < 0 || beat.target_scene >= len(program.scenes) || beat.target_pc < 0 {
+		result.error = .Invalid_Target
+		return result
+	}
+	result.beat_index = selected
+	result.target = Cursor{
+		scene = beat.target_scene,
+		scene_id = program.scenes[beat.target_scene].id,
+		pc = beat.target_pc,
+	}
+	return result
+}
+
+explain_contextual_selection :: proc(
+	program: ^Program,
+	pool_id: string,
+	user_data: rawptr,
+	resolve_field: Field_Resolver,
+) -> (explanation: Contextual_Selection_Explanation) {
+	if program == nil {
+		explanation.error = .Unknown_Pool
+		return
+	}
+	pool_index := -1
+	for i in 0..<len(program.contextual_pools) {
+		if program.contextual_pools[i].id == pool_id { pool_index = i; break }
+	}
+	if pool_index < 0 {
+		explanation.error = .Unknown_Pool
+		return
+	}
+	pool := program.contextual_pools[pool_index]
+	explanation.pool_id = pool.id
+	selected := -1
+	for i in pool.beat_start..<pool.beat_start+pool.beat_count {
+		beat := program.contextual_beats[i]
+		entry := Contextual_Beat_Explanation{
+			beat_id = beat.id,
+			condition = beat.condition,
+			priority = beat.priority,
+			fallback = beat.fallback,
+		}
+		if beat.fallback {
+			entry.eligible = true
+		} else {
+			entry.query = explain_query(program, beat.condition_index, user_data, resolve_field)
+			entry.eligible = entry.query.error == .None && entry.query.value
+			if entry.query.error != .None {
+				explanation.error = .Query_Evaluation_Failed
+			}
+		}
+		append(&explanation.beats, entry)
+		if explanation.error != .None { return }
+		if !entry.fallback && entry.eligible && (selected < 0 || contextual_beat_precedes(beat, program.contextual_beats[selected], pool.policy)) {
+			selected = i
+		}
+	}
+	if explanation.error != .None { return }
+	if selected < 0 { selected = pool.fallback_beat }
+	if selected < pool.beat_start || selected >= pool.beat_start+pool.beat_count {
+		explanation.error = .Missing_Fallback
+		return
+	}
+	beat := program.contextual_beats[selected]
+	explanation.selected_beat_id = beat.id
+	for i in 0..<len(explanation.beats) {
+		if pool.beat_start+i == selected { explanation.beats[i].selected = true }
+	}
+	return
+}
+
+destroy_contextual_selection_explanation :: proc(explanation: ^Contextual_Selection_Explanation) {
+	for beat in explanation.beats { delete(beat.query.steps) }
+	delete(explanation.beats)
+	explanation^ = {}
+}
+
+contextual_beat_precedes :: proc(candidate, current: Contextual_Beat, policy: Selection_Policy) -> bool {
+	switch policy {
+	case .Priority:
+		if candidate.priority != current.priority { return candidate.priority > current.priority }
+		return candidate.id < current.id
+	}
+	return candidate.id < current.id
 }
 
 // continue_dialogue advances past the current line or narration. Call advance
@@ -264,7 +410,7 @@ submit_choice :: proc(
 		result.action_error = action_result.error
 		return result
 	}
-	if choice.action_outcomes&(u8(1)<<u8(action_result.outcome)) == 0 {
+	if !choice_declares_outcome(choice, action_result.outcome) {
 		result.error = .Action_Contract_Violation
 		return result
 	}

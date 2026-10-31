@@ -92,13 +92,25 @@ evaluate_query_node :: proc(
 		}
 	case .And, .Or:
 		left := evaluate_query_node(program, node.left, user_data, resolve_field, explanation)
-		right := evaluate_query_node(program, node.right, user_data, resolve_field, explanation)
-		if left.error != .None { result = left } else if right.error != .None { result = right } else if left.value.type != .Boolean || right.value.type != .Boolean {
+		if left.error != .None {
+			result = left
+			append_skipped_query_subtree(program, node.right, explanation)
+		} else if left.value.type != .Boolean {
 			result.error = .Type_Mismatch
-		} else if node.operator == .And {
-			result.value = Query_Value{type = .Boolean, boolean = left.value.boolean && right.value.boolean}
+			append_skipped_query_subtree(program, node.right, explanation)
+		} else if node.operator == .And && !left.value.boolean {
+			result.value = Query_Value{type = .Boolean, boolean = false}
+			append_skipped_query_subtree(program, node.right, explanation)
+		} else if node.operator == .Or && left.value.boolean {
+			result.value = Query_Value{type = .Boolean, boolean = true}
+			append_skipped_query_subtree(program, node.right, explanation)
 		} else {
-			result.value = Query_Value{type = .Boolean, boolean = left.value.boolean || right.value.boolean}
+			right := evaluate_query_node(program, node.right, user_data, resolve_field, explanation)
+			if right.error != .None { result = right } else if right.value.type != .Boolean {
+				result.error = .Type_Mismatch
+			} else {
+				result.value = right.value
+			}
 		}
 	case .Equal, .Not_Equal, .Less, .Less_Equal, .Greater, .Greater_Equal:
 		left := evaluate_query_node(program, node.left, user_data, resolve_field, explanation)
@@ -121,6 +133,25 @@ evaluate_query_node :: proc(
 		})
 	}
 	return result
+}
+
+append_skipped_query_subtree :: proc(program: ^Program, index: int, explanation: ^Query_Explanation) {
+	if explanation == nil || index < 0 || index >= len(program.query_nodes) { return }
+	node := program.query_nodes[index]
+	append(&explanation.steps, Query_Evaluation_Step{
+		node_index = index,
+		operator = node.operator,
+		field_id = node.field_id,
+		skipped = true,
+	})
+	switch node.operator {
+	case .Not:
+		append_skipped_query_subtree(program, node.left, explanation)
+	case .And, .Or, .Equal, .Not_Equal, .Less, .Less_Equal, .Greater, .Greater_Equal:
+		append_skipped_query_subtree(program, node.left, explanation)
+		append_skipped_query_subtree(program, node.right, explanation)
+	case .Field, .Opaque_Field, .Boolean_Literal, .Integer_Literal, .Enumeration_Literal:
+	}
 }
 
 query_enum_value_registered :: proc(program: ^Program, field_id, enum_value: string) -> bool {

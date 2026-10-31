@@ -39,6 +39,7 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 	choice_condition := ""
 	choice_condition_index := -1
 	choice_condition_not := false
+	selection_pool_index := -1
 	branch_stack: [dynamic]int
 	branch_else_jumps: [dynamic]int
 	for raw_line, line_index in lines {
@@ -47,6 +48,10 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 		line := strings.trim_space(raw_line)
 		if line == "" || strings.has_prefix(line, "//") { continue }
 		if strings.has_prefix(line, ":: ") {
+			if selection_pool_index >= 0 {
+				diagnose(&result, .Invalid_Selection, line_no, 1, "@select must end with @endselect")
+				selection_pool_index = -1
+			}
 			id := strings.trim_space(line[3:])
 			if !valid_id(id) {
 				diagnose(&result, .Invalid_ID, line_no, 4, id)
@@ -69,6 +74,102 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 		}
 		if current_scene < 0 {
 			diagnose(&result, .Syntax, line_no, 1, "expected a :: scene declaration")
+			continue
+		}
+		if selection_pool_index >= 0 && !strings.has_prefix(line, "@beat ") && !strings.has_prefix(line, "@fallback ") && line != "@endselect" {
+			diagnose(&result, .Invalid_Selection, line_no, indent+1, "@select accepts only @beat, @fallback, and @endselect")
+			continue
+		}
+		if strings.has_prefix(line, "@select ") {
+			if selection_pool_index >= 0 || choice_node >= 0 {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "@select cannot be nested or placed inside a choice group")
+				continue
+			}
+			pool_id, policy, valid_header := parse_selection_header(line[8:])
+			if !valid_header {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "expected @select pool_id priority")
+				continue
+			}
+			duplicate := false
+			for pool in result.program.contextual_pools { if pool.id == pool_id { duplicate = true; break } }
+			if duplicate {
+				diagnose(&result, .Duplicate_Selection_Pool, line_no, indent+1, pool_id)
+				continue
+			}
+			pool_index := len(result.program.contextual_pools)
+			append(&result.program.contextual_pools, Contextual_Pool{
+				id = pool_id,
+				policy = policy,
+				beat_start = len(result.program.contextual_beats),
+				fallback_beat = -1,
+				line = line_no,
+			})
+			append(&result.program.nodes, Node{kind = .Contextual_Select, contextual_pool_index = pool_index, line = line_no})
+			selection_pool_index = pool_index
+			continue
+		}
+		if strings.has_prefix(line, "@endselect") {
+			if selection_pool_index < 0 || line != "@endselect" {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "@endselect without a matching @select")
+			} else {
+				pool := &result.program.contextual_pools[selection_pool_index]
+				if pool.fallback_beat < 0 {
+					diagnose(&result, .Missing_Selection_Fallback, line_no, indent+1, pool.id)
+				}
+				selection_pool_index = -1
+			}
+			continue
+		}
+		if strings.has_prefix(line, "@beat ") {
+			if selection_pool_index < 0 {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "@beat must be inside @select")
+				continue
+			}
+			beat, valid_beat := parse_contextual_beat(line[6:], line_no)
+			if !valid_beat {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "expected @beat id priority N if condition -> target")
+				continue
+			}
+			pool := &result.program.contextual_pools[selection_pool_index]
+			duplicate := false
+			for existing in result.program.contextual_beats[pool.beat_start:] {
+				if existing.id == beat.id { duplicate = true; break }
+			}
+			if duplicate {
+				diagnose(&result, .Duplicate_Selection_Beat, line_no, indent+1, beat.id)
+				continue
+			}
+			beat.condition_index, _ = compile_query(&result, registry, beat.condition, line_no, indent+1)
+			append(&result.program.contextual_beats, beat)
+			pool.beat_count += 1
+			continue
+		}
+		if strings.has_prefix(line, "@fallback ") {
+			if selection_pool_index < 0 {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "@fallback must be inside @select")
+				continue
+			}
+			beat, valid_fallback := parse_contextual_fallback(line[10:], line_no)
+			if !valid_fallback {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "expected @fallback id -> target")
+				continue
+			}
+			pool := &result.program.contextual_pools[selection_pool_index]
+			duplicate := false
+			for existing in result.program.contextual_beats[pool.beat_start:] {
+				if existing.id == beat.id { duplicate = true; break }
+			}
+			if duplicate {
+				diagnose(&result, .Duplicate_Selection_Beat, line_no, indent+1, beat.id)
+				continue
+			}
+			if pool.fallback_beat >= 0 {
+				diagnose(&result, .Invalid_Selection, line_no, indent+1, "a selection can have only one @fallback")
+				continue
+			}
+			pool.fallback_beat = len(result.program.contextual_beats)
+			append(&result.program.contextual_beats, beat)
+			pool.beat_count += 1
 			continue
 		}
 		if strings.has_prefix(line, "@scene ") {
@@ -324,12 +425,74 @@ resolve_targets :: proc(result: ^Compilation, registry: Registry) {
 		node.target_scene, node.target_pc = resolve_reference(&result.program, node.jump_target)
 		if node.target_scene < 0 { diagnose(result, .Unknown_Target, node.line, 1, node.jump_target) }
 	}
+	for i in 0..<len(result.program.contextual_pools) {
+		pool := &result.program.contextual_pools[i]
+		if pool.fallback_beat < 0 {
+			diagnose(result, .Missing_Selection_Fallback, pool.line, 1, pool.id)
+		}
+	}
+	for i in 0..<len(result.program.contextual_beats) {
+		beat := &result.program.contextual_beats[i]
+		if beat.target == "" {
+			diagnose(result, .Unknown_Target, beat.line, 1, "contextual beat missing target")
+			continue
+		}
+		beat.target_scene, beat.target_pc = resolve_reference(&result.program, beat.target)
+		if beat.target_scene < 0 { diagnose(result, .Unknown_Target, beat.line, 1, beat.target) }
+	}
 	for i in 0..<len(result.program.anchors) {
 		anchor := &result.program.anchors[i]
 		if anchor.checkpoint && anchor.kind != .Choice {
 			diagnose(result, .Syntax, 1, 1, "checkpoint anchors must be choices")
 		}
 	}
+}
+
+parse_selection_header :: proc(value: string) -> (id: string, policy: Selection_Policy, ok: bool) {
+	s := strings.trim_space(value)
+	space := index_of(s, " ")
+	if space <= 0 { return "", .Priority, false }
+	id = s[:space]
+	policy_name := strings.trim_space(s[space+1:])
+	if !valid_id(id) || policy_name != "priority" { return "", .Priority, false }
+	return id, .Priority, true
+}
+
+parse_contextual_beat :: proc(value: string, line: int) -> (beat: Contextual_Beat, ok: bool) {
+	s := strings.trim_space(value)
+	arrow := index_of(s, " -> ")
+	if arrow < 0 { return {}, false }
+	declaration := strings.trim_space(s[:arrow])
+	condition_marker := index_of(declaration, " if ")
+	if condition_marker < 0 { return {}, false }
+	header := strings.trim_space(declaration[:condition_marker])
+	beat.condition = strings.trim_space(declaration[condition_marker+4:])
+	beat.target = strings.trim_space(s[arrow+4:])
+	first_space := index_of(header, " ")
+	if first_space <= 0 || beat.condition == "" || beat.target == "" { return {}, false }
+	beat.id = header[:first_space]
+	priority_spec := strings.trim_space(header[first_space+1:])
+	if !valid_id(beat.id) || !strings.has_prefix(priority_spec, "priority ") { return {}, false }
+	priority, parsed := parse_i64(strings.trim_space(priority_spec[9:]))
+	if !parsed { return {}, false }
+	beat.priority = priority
+	beat.target_scene, beat.target_pc = -1, -1
+	beat.line = line
+	return beat, true
+}
+
+parse_contextual_fallback :: proc(value: string, line: int) -> (beat: Contextual_Beat, ok: bool) {
+	s := strings.trim_space(value)
+	arrow := index_of(s, " -> ")
+	if arrow < 0 { return {}, false }
+	beat.id = strings.trim_space(s[:arrow])
+	beat.target = strings.trim_space(s[arrow+4:])
+	if !valid_id(beat.id) || beat.target == "" { return {}, false }
+	beat.condition_index = -1
+	beat.fallback = true
+	beat.target_scene, beat.target_pc = -1, -1
+	beat.line = line
+	return beat, true
 }
 
 validate_action_routes :: proc(result: ^Compilation, choice: ^Choice, action: Action_Definition) {
@@ -426,6 +589,13 @@ build_edges :: proc(program: ^Program) {
 				source_anchor := previous_anchor(program, scene_index_value, node_index)
 				target_anchor := referenced_anchor(program, node.target_scene, node.target_pc)
 				if source_anchor != "" && target_anchor != "" { append_edge(program, source_anchor, target_anchor, "jump") }
+			} else if node.kind == .Contextual_Select && node.contextual_pool_index >= 0 && node.contextual_pool_index < len(program.contextual_pools) {
+				source_anchor := previous_anchor(program, scene_index_value, node_index)
+				pool := program.contextual_pools[node.contextual_pool_index]
+				for beat in program.contextual_beats[pool.beat_start:pool.beat_start+pool.beat_count] {
+					target_anchor := referenced_anchor(program, beat.target_scene, beat.target_pc)
+					if source_anchor != "" && target_anchor != "" { append_edge(program, source_anchor, target_anchor, "contextual") }
+				}
 			}
 		}
 	}
@@ -481,6 +651,12 @@ validate_reachability :: proc(result: ^Compilation) {
 						for route in result.program.outcome_routes[option.outcome_start:option.outcome_start+option.outcome_count] {
 							if route.target_scene >= 0 && !reachable[route.target_scene] { reachable[route.target_scene] = true; changed = true }
 						}
+					}
+				}
+				if node.kind == .Contextual_Select && node.contextual_pool_index >= 0 && node.contextual_pool_index < len(result.program.contextual_pools) {
+					pool := result.program.contextual_pools[node.contextual_pool_index]
+					for beat in result.program.contextual_beats[pool.beat_start:pool.beat_start+pool.beat_count] {
+						if beat.target_scene >= 0 && !reachable[beat.target_scene] { reachable[beat.target_scene] = true; changed = true }
 					}
 				}
 			}

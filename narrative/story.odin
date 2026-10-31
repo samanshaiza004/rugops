@@ -79,6 +79,7 @@ Query_Evaluation_Step :: struct {
 	failed_field: string,
 	value:      Query_Value,
 	error:      Query_Error,
+	skipped:    bool,
 }
 
 Query_Explanation :: struct {
@@ -148,6 +149,7 @@ Node_Kind :: enum u8 {
 	Dialogue,
 	Narration,
 	Choice_Group,
+	Contextual_Select,
 	Branch,
 	Jump,
 	Anchor,
@@ -175,9 +177,67 @@ Node :: struct {
 	target_pc:     int,
 	choice_start:  int,
 	choice_count:  int,
+	contextual_pool_index: int,
 	anchor_id:     string,
 	checkpoint:    bool,
 	line:          int,
+}
+
+Selection_Policy :: enum u8 {
+	Priority,
+}
+
+Contextual_Pool :: struct {
+	id:            string,
+	policy:        Selection_Policy,
+	beat_start:    int,
+	beat_count:    int,
+	fallback_beat: int,
+	line:          int,
+}
+
+Contextual_Beat :: struct {
+	id:              string,
+	condition:       string,
+	condition_index: int,
+	priority:        i64,
+	fallback:        bool,
+	target:          string,
+	target_scene:    int,
+	target_pc:       int,
+	line:            int,
+}
+
+Contextual_Selection_Error :: enum u8 {
+	None,
+	Unknown_Pool,
+	Missing_Fallback,
+	Query_Evaluation_Failed,
+	Invalid_Target,
+}
+
+Contextual_Beat_Explanation :: struct {
+	beat_id:   string,
+	condition: string,
+	priority:  i64,
+	fallback:  bool,
+	eligible:  bool,
+	selected:  bool,
+	query:     Query_Explanation,
+}
+
+Contextual_Selection_Explanation :: struct {
+	pool_id:          string,
+	selected_beat_id: string,
+	error:            Contextual_Selection_Error,
+	beats:            [dynamic]Contextual_Beat_Explanation,
+}
+
+Contextual_Selection :: struct {
+	beat_index:  int,
+	target:      Cursor,
+	error:       Contextual_Selection_Error,
+	query_error: Query_Error,
 }
 
 Choice :: struct {
@@ -232,6 +292,8 @@ Program :: struct {
 	nodes:   [dynamic]Node,
 	choices: [dynamic]Choice,
 	outcome_routes: [dynamic]Choice_Outcome_Route,
+	contextual_pools: [dynamic]Contextual_Pool,
+	contextual_beats: [dynamic]Contextual_Beat,
 	anchors: [dynamic]Anchor,
 	edges:   [dynamic]Edge,
 	query_nodes: [dynamic]Query_Node,
@@ -265,6 +327,10 @@ Diagnostic_Code :: enum u8 {
 	Unexpected_Outcome_Route,
 	Duplicate_Outcome_Route,
 	Unreachable_Scene,
+	Duplicate_Selection_Pool,
+	Duplicate_Selection_Beat,
+	Invalid_Selection,
+	Missing_Selection_Fallback,
 }
 
 Diagnostic :: struct {
@@ -301,6 +367,8 @@ destroy_program :: proc(program: ^Program) {
 	delete(program.nodes)
 	delete(program.choices)
 	delete(program.outcome_routes)
+	delete(program.contextual_pools)
+	delete(program.contextual_beats)
 	delete(program.anchors)
 	delete(program.edges)
 	delete(program.query_nodes)

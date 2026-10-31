@@ -4,7 +4,7 @@ Rugops is an experimental, Odin-first game foundation built around explicit stat
 
 The engine is intentionally small: `core/` supplies a deterministic integer clock, stable scheduled-event queue, and generic command-history records. `examples/unobserved/game/` owns the game's world, rules, observations, and versioned save format. `examples/unobserved/main/` translates keyboard and mouse input to game commands and renders observations with raylib. No raylib package is imported by the core or the narrative simulation.
 
-`narrative/` is an optional, renderer-independent library for compiling readable dialogue scripts and executing their directed control flow. It does not depend on `core/`, raylib, or a game model. Games declare typed fields and actions; they keep world state, action consequences, and narrative-map meaning in game code.
+`narrative/` is an optional, renderer-independent library for compiling readable dialogue scripts, executing directed scenes, and selecting contextual beats. It does not depend on `core/`, raylib, or a game model. Games declare typed fields and actions; they keep world state, action consequences, and narrative-map meaning in game code.
 
 ## Requirements
 
@@ -87,11 +87,25 @@ submission := narrative.submit_choice(&compiled.program, &state, offer,
 }
 ```
 
-Conditions are a small Boolean expression language with `and`, `or`, `not`, parentheses, integer comparisons, and registered enum comparisons. For example, `@if masha.has_page and player.bond >= 3`. Fields resolve through a read-only callback; unknown fields and resolver failures are reported as errors, never converted to false. Registered opaque Boolean predicates can be referenced with `opaque:predicate_name`; their declared field dependencies remain inspectable, but their internals are not symbolically analyzable. `explain_query` reports the evaluated subexpressions and any failing field. Call `destroy_query_explanation` when finished with its owned step list.
+Conditions are a small Boolean expression language with `and`, `or`, `not`, parentheses, integer comparisons, and registered enum comparisons. For example, `@if masha.has_page and player.bond >= 3`. `and` and `or` use ordinary short-circuit evaluation; explanations mark skipped operands instead of querying them. Fields resolve through a read-only callback; unknown fields and resolver failures are reported as errors, never converted to false. Registered opaque Boolean predicates can be referenced with `opaque:predicate_name`; their declared field dependencies remain inspectable, but their internals are not symbolically analyzable. `explain_query` reports evaluated and skipped subexpressions and any failing field. Call `destroy_query_explanation` when finished with its owned step list.
 
-`advance` resolves branches, jumps, anchors, and end instructions until it reaches dialogue, narration, or a choice group. `visible_choice` maps a player-visible option ordinal to its current compiled choice. `submit_choice` accepts the program-scoped handle captured from that observation, rechecks eligibility, validates all declared continuations, invokes the game-owned action resolver, and advances the narrative cursor according to its typed outcome. Actions can declare accepted, refused, interrupted, or deferred results; every declared non-accepted outcome needs an explicit `@on` continuation. The game resolver validates before mutating and returns an explicit action error for an invalid command. The narrative runtime does not advance logical time by itself.
+Contextual pools are explicit priority selections with stable beat IDs and an authored fallback:
+
+```text
+@select masha_response priority
+  @beat distrustful priority 20 if rafael.suspects_player -> reply.distrustful
+  @beat knows_page priority 10 if masha.has_page -> reply.knows_page
+  @fallback ordinary -> reply.ordinary
+@endselect
+```
+
+The highest-priority eligible beat wins; equal priorities use ascending beat ID as a stable tie-break. The fallback runs only when no conditional beat matches. A query error stops selection with an error. `explain_contextual_selection` reports each beat's condition, eligibility, priority, and selection result with its query explanation; free its owned data with `destroy_contextual_selection_explanation`. Pools do not keep a second dialogue flag store: every visit reads current game-owned fields. `Contextual_Beat_Selected` runtime events let games include the chosen beat in their own experience trace.
+
+`advance` resolves branches, jumps, contextual selections, anchors, and end instructions until it reaches dialogue, narration, or a choice group. `visible_choice` maps a player-visible option ordinal to its current compiled choice. `submit_choice` accepts the program-scoped handle captured from that observation, rechecks eligibility, validates all declared continuations, invokes the game-owned action resolver, and advances the narrative cursor according to its typed outcome. Actions can declare accepted, refused, interrupted, or deferred results; every declared non-accepted outcome needs an explicit `@on` continuation. A game should check that the intended outcome is declared before applying any effects and return errors without mutation. Rugops reports an undeclared outcome but cannot roll back arbitrary game-owned state. The narrative runtime does not advance logical time by itself.
 
 The compiled program owns its source buffer and query schema, and its source-authored strings refer into that buffer. Keep the `Compilation` alive for as long as its `Program` or runtime state is in use. `Program_Metadata` gives the compiled program an author-defined ID and version; the program also exposes a source hash and identity hash for save compatibility checks and diagnostics. These hashes do not migrate runtime positions. Runtime instruction positions are compile-local; store stable scene/anchor IDs in saves and resolve them with `cursor_at_anchor` after recompilation. Structural program changes may still require a deliberate game-authored migration; never guess when a saved position cannot be mapped safely.
+
+The current `State` and `Choice_ID` represent one directed conversation cursor; choice handles include the program identity and compiled choice index, but not a conversation-instance ID or offer revision. Before a world runs multiple active conversations, add those dimensions to the game-owned conversation instance and the choice handle so stale offers from one instance cannot be submitted to another.
 
 ## Save compatibility
 

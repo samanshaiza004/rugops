@@ -10,11 +10,12 @@ NARRATIVE_TEST_ACTIONS: [3]narrative.Action_Definition = {
 	{id = "talk_to_masha", can_interrupt = true},
 }
 NARRATIVE_TEST_ENUM_VALUES: [2]string = {"archive", "courtyard"}
-NARRATIVE_TEST_FIELDS: [4]narrative.Field_Definition = {
+NARRATIVE_TEST_FIELDS: [5]narrative.Field_Definition = {
 	{id = "page_found", type = .Boolean},
 	{id = "bond", type = .Integer},
 	{id = "location", type = .Enumeration, enum_type = "location", enum_values = NARRATIVE_TEST_ENUM_VALUES[:]},
 	{id = "can_smell_trap", type = .Boolean, opaque = true, reads = {"page_found"}},
+	{id = "rafael.suspects_player", type = .Boolean},
 }
 
 Narrative_Test_Context :: struct {
@@ -28,6 +29,8 @@ Narrative_Test_Context :: struct {
 	scene_count:     u32,
 	anchor_count:    u32,
 	checkpoint_count: u32,
+	resolver_calls:  u32,
+	suspects_player: bool,
 }
 
 narrative_test_registry :: proc() -> narrative.Registry {
@@ -45,6 +48,7 @@ narrative_test_field :: proc(user_data: rawptr, field_id: string) -> (narrative.
 	case "bond": return narrative.Query_Value{type = .Integer, integer = test_context.bond}, .None
 	case "location": return narrative.Query_Value{type = .Enumeration, enum_type = "location", enum_value = test_context.location}, .None
 	case "can_smell_trap": return narrative.Query_Value{type = .Boolean, boolean = test_context.page_found}, .None
+	case "rafael.suspects_player": return narrative.Query_Value{type = .Boolean, boolean = test_context.suspects_player}, .None
 	}
 	return {}, .Unknown_Field
 }
@@ -57,18 +61,33 @@ narrative_test_wrong_enum_field :: proc(user_data: rawptr, field_id: string) -> 
 	return {}, .Unknown_Field
 }
 
+narrative_test_short_circuit_field :: proc(user_data: rawptr, field_id: string) -> (narrative.Query_Value, narrative.Query_Error) {
+	test_context := cast(^Narrative_Test_Context)user_data
+	test_context.resolver_calls += 1
+	if field_id == "page_found" {
+		return narrative.Query_Value{type = .Boolean, boolean = test_context.page_found}, .None
+	}
+	if field_id == "rafael.suspects_player" {
+		return narrative.Query_Value{type = .Boolean, boolean = test_context.suspects_player}, .None
+	}
+	return {}, .Resolver_Failed
+}
+
 narrative_test_action :: proc(user_data: rawptr, choice: ^narrative.Choice) -> narrative.Action_Execution {
 	test_context := cast(^Narrative_Test_Context)user_data
 	if test_context.reject_action { return narrative.Action_Execution{error = .Invalid_Command} }
 	if choice.action == "ask_about_page" && test_context.refuse_action {
+		assert(narrative.choice_declares_outcome(choice, .Refused))
 		test_context.actions_applied += 1
 		return narrative.Action_Execution{outcome = .Refused}
 	}
 	if choice.action == "talk_to_masha" && test_context.interrupt_action {
+		assert(narrative.choice_declares_outcome(choice, .Interrupted))
 		test_context.actions_applied += 1
 		return narrative.Action_Execution{outcome = .Interrupted}
 	}
 	if choice.action == "continue_story" {
+		assert(narrative.choice_declares_outcome(choice, .Accepted))
 		test_context.actions_applied += 1
 		return narrative.Action_Execution{outcome = .Accepted}
 	}
@@ -87,6 +106,7 @@ narrative_test_event :: proc(user_data: rawptr, event: narrative.Runtime_Event) 
 	case .Anchor_Reached:
 		test_context.anchor_count += 1
 		if event.checkpoint { test_context.checkpoint_count += 1 }
+	case .Contextual_Beat_Selected:
 	}
 }
 
@@ -135,6 +155,119 @@ Narrator: The evidence is incomplete.
 	query_false := narrative.explain_query(&compiled.program, 0, user_data, narrative_test_field)
 	defer narrative.destroy_query_explanation(&query_false)
 	assert(query_false.error == .None && !query_false.value)
+}
+
+@(test)
+narrative_boolean_queries_short_circuit_and_explain_skipped_fields :: proc(t: ^testing.T) {
+	_ = t
+	compiled := narrative.compile(`:: start
+@if page_found and opaque:can_smell_trap
+Narrator: both
+@endif
+@if page_found or opaque:can_smell_trap
+Narrator: either
+@endif
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&compiled)
+	assert(!narrative.has_errors(&compiled))
+	context_value := Narrative_Test_Context{}
+	user_data := cast(rawptr)&context_value
+	and_explanation := narrative.explain_query(&compiled.program, 0, user_data, narrative_test_short_circuit_field)
+	defer narrative.destroy_query_explanation(&and_explanation)
+	assert(and_explanation.error == .None && !and_explanation.value)
+	assert(context_value.resolver_calls == 1)
+	assert(len(and_explanation.steps) > 0)
+	skipped_and_field := false
+	for step in and_explanation.steps {
+		if step.field_id == "can_smell_trap" && step.skipped { skipped_and_field = true }
+	}
+	assert(skipped_and_field)
+	context_value.page_found = true
+	context_value.resolver_calls = 0
+	or_explanation := narrative.explain_query(&compiled.program, 1, user_data, narrative_test_short_circuit_field)
+	defer narrative.destroy_query_explanation(&or_explanation)
+	assert(or_explanation.error == .None && or_explanation.value)
+	assert(context_value.resolver_calls == 1)
+	skipped_or_field := false
+	for step in or_explanation.steps {
+		if step.field_id == "can_smell_trap" && step.skipped { skipped_or_field = true }
+	}
+	assert(skipped_or_field)
+}
+
+@(test)
+narrative_contextual_selection_uses_priority_stable_ties_fallback_and_explanations :: proc(t: ^testing.T) {
+	_ = t
+	compiled := narrative.compile(`:: ask
+@anchor ask "Masha answers" start
+@select masha_response priority
+  @beat distrustful priority 20 if rafael.suspects_player -> reply.distrustful
+  @beat suspicious priority 10 if page_found -> reply.suspicious
+  @beat suspicious_alt priority 10 if page_found -> reply.alternate
+  @fallback ordinary -> reply.ordinary
+@endselect
+
+:: reply.ordinary
+Narrator: ordinary response
+@end
+
+:: reply.suspicious
+Narrator: suspicious response
+@end
+
+:: reply.alternate
+Narrator: alternate response
+@end
+
+:: reply.distrustful
+Narrator: distrustful response
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&compiled)
+	assert(!narrative.has_errors(&compiled))
+	context_value := Narrative_Test_Context{}
+	user_data := cast(rawptr)&context_value
+	ordinary := narrative.explain_contextual_selection(&compiled.program, "masha_response", user_data, narrative_test_field)
+	defer narrative.destroy_contextual_selection_explanation(&ordinary)
+	assert(ordinary.error == .None && ordinary.selected_beat_id == "ordinary")
+	assert(ordinary.beats[0].eligible == false && ordinary.beats[0].query.value == false)
+	assert(ordinary.beats[3].fallback && ordinary.beats[3].selected)
+
+	context_value.page_found = true
+	suspicious := narrative.explain_contextual_selection(&compiled.program, "masha_response", user_data, narrative_test_field)
+	defer narrative.destroy_contextual_selection_explanation(&suspicious)
+	assert(suspicious.error == .None && suspicious.selected_beat_id == "suspicious")
+	assert(suspicious.beats[1].eligible && suspicious.beats[1].selected)
+	assert(suspicious.beats[2].eligible && !suspicious.beats[2].selected)
+
+	context_value.suspects_player = true
+	distrustful := narrative.explain_contextual_selection(&compiled.program, "masha_response", user_data, narrative_test_field)
+	defer narrative.destroy_contextual_selection_explanation(&distrustful)
+	assert(distrustful.error == .None && distrustful.selected_beat_id == "distrustful")
+	assert(distrustful.beats[0].eligible && distrustful.beats[0].selected)
+
+	state := narrative.new_state(&compiled.program)
+	runtime_error, query_error := narrative.advance(&compiled.program, &state, user_data, narrative_test_field, nil)
+	assert(runtime_error == .None && query_error == .None)
+	assert(state.cursor.scene_id == "reply.distrustful")
+	assert(state.cursor.anchor_id == "ask")
+}
+
+@(test)
+narrative_contextual_selection_requires_a_fallback_and_valid_targets :: proc(t: ^testing.T) {
+	_ = t
+	compiled := narrative.compile(`:: start
+@select response priority
+  @beat matched priority 1 if page_found -> missing.target
+@endselect
+
+:: unused
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&compiled)
+	assert(has_diagnostic(&compiled, .Missing_Selection_Fallback))
+	assert(has_diagnostic(&compiled, .Unknown_Target))
 }
 
 @(test)
@@ -383,6 +516,7 @@ narrative_submit_rejects_an_implicit_action_outcome :: proc(t: ^testing.T) {
 	submission := narrative.submit_choice(&compiled.program, &state, offer, user_data, narrative_test_field, narrative_test_missing_outcome)
 	assert(submission.error == .Action_Contract_Violation)
 	assert(state.cursor == before)
+	assert(test_context.actions_applied == 0)
 }
 
 @(test)
