@@ -1,74 +1,23 @@
 {
     "version": "2.0.0",
-    "command": "",
-    "args": [],
     "tasks": [
         {
-            "label": "Build Debug",
+            "label": "Build Rugops demo",
             "type": "shell",
-            "windows": {
-                "command": "${workspaceFolder}/build_debug.bat",
-            },
-            "linux": {
-                "command": "${workspaceFolder}/build_debug.sh",
-            },
-            "osx": {
-                "command": "${workspaceFolder}/build_debug.sh",
-            },
+            "command": "${workspaceFolder}/scripts/build.sh",
             "group": "build"
         },
         {
-            "label": "Build Release",
+            "label": "Run headless tests",
             "type": "shell",
-            "windows": {
-                "command": "${workspaceFolder}/build_release.bat",
-            },
-            "linux": {
-                "command": "${workspaceFolder}/build_release.sh",
-            },
-            "osx": {
-                "command": "${workspaceFolder}/build_release.sh",
-            },
-            "group": "build"
+            "command": "${workspaceFolder}/scripts/test.sh",
+            "group": "test"
         },
         {
-            "label": "Build Web",
+            "label": "Run headless invite scenario",
             "type": "shell",
-            "windows": {
-                "command": "${workspaceFolder}/build_web.bat",
-            },
-            "linux": {
-                "command": "${workspaceFolder}/build_web.sh",
-            },
-            "osx": {
-                "command": "${workspaceFolder}/build_web.sh",
-            },
-            "group": "build"
-        },
-        {
-            "label": "Build Hot Reload",
-            "type": "shell",
-            "windows": {
-                "command": "${workspaceFolder}/build_hot_reload.bat",
-            },
-            "linux": {
-                "command": "${workspaceFolder}/build_hot_reload.sh",
-            },
-            "osx": {
-                "command": "${workspaceFolder}/build_hot_reload.sh",
-            },
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": false,
-                "clear": true
-            },
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
+            "command": "${workspaceFolder}/scripts/headless.sh",
+            "args": ["scenario", "invite"]
         }
     ]
 }

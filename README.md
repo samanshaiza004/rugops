@@ -1,123 +1,81 @@
-# Odin + Raylib + Hot Reload template
+# Rugops
 
-This is an [Odin](https://github.com/odin-lang/Odin) + [Raylib](https://github.com/raysan5/raylib) game template with [Hot Reloading](http://zylinski.se/posts/hot-reload-gameplay-code/) pre-setup. It makes it possible to reload gameplay code while the game is running.
+Rugops is an experimental, Odin-first game foundation built around explicit state transitions and logical time. The first example, **The Unobserved**, is a short visual novel with a headless simulation and a raylib host.
 
-Supported platforms: Windows, macOS, Linux and [web](#web-build).
+The engine is intentionally small: `core/` supplies a deterministic integer clock, stable scheduled-event queue, and generic command-history records. `examples/unobserved/game/` owns the game's world, rules, observations, and versioned save format. `examples/unobserved/main/` translates keyboard and mouse input to game commands and renders observations with raylib. No raylib package is imported by the core or the narrative simulation.
 
-Supported editors and debuggers: [Sublime Text](#sublime-text), [VS Code](#vs-code) and [RAD Debugger](#rad-debugger).
+## Requirements
 
-![hot_reload gif](https://github.com/user-attachments/assets/18059ab2-0878-4617-971d-e629a969fc93)
+- Odin compiler (the toolchain used for this milestone: `dev-2026-09-nightly:a2fb372`)
+- Odin's bundled `vendor:raylib` bindings and library (verified as raylib 6.0)
+- macOS, Windows, or Linux desktop for the native host
 
-See The Legend of Tuna repository for an example project that also uses Box2D: https://github.com/karl-zylinski/the-legend-of-tuna
+The repository is configured as an Odin collection named `rugops`. Build scripts pass `-collection:rugops=.`.
 
-I used this kind of hot reloading while developing my game [CAT & ONION](https://store.steampowered.com/app/2781210/CAT__ONION/).
+## Build, run, and test
 
-## Hot reload quick start
+From the repository root:
 
-> [!NOTE]
-> These instructions use some Windows terminology. If you are on mac / linux, then replace these words:
-> - `bat` -> `sh`
-> - `exe` -> `bin`
-> - `dll` -> `dylib` (mac), `so` (linux)
+```sh
+./scripts/build.sh
+./scripts/run.sh
+./scripts/test.sh
+```
 
-1. Run `build_hot_reload.bat` to create `game_hot_reload.exe` (located at the root of the project) and `game.dll` (located in `build/hot_reload`). Note: It expects odin compiler to be part of your PATH environment variable.
-2. Run `game_hot_reload.exe`, leave it running.
-3. Make changes to the gameplay code in `source/game.odin`. For example, change the line `rl.ClearBackground(rl.BLACK)` so that it instead uses `rl.BLUE`. Save the file.
-4. Run `build_hot_reload.bat`, it will recompile `game.dll`.
-5. The running `game_hot_reload.exe` will see that `game.dll` changed and reload it. But it will use the same `Game_Memory` (a struct defined in `source/game.odin`) as before. This will make the game use your new code without having to restart.
+`run.sh` builds and starts the resizable 1280×720 native window. The view keeps its aspect ratio and letterboxes when resized. Use Enter, Space, or click to read; use 1/2, Up/Down plus Enter, or click a choice to act. F5 saves and F9 restores `build/unobserved-save.json`. Escape or the window close button exits.
 
-Note, in step 4: `build_hot_reload.bat` does not rebuild `game_hot_reload.exe`. It checks if `game_hot_reload.exe` is already running. If it is, then it skips compiling it.
+The headless CLI does not initialize raylib or open a window:
 
-## Release builds
+```sh
+./scripts/headless.sh scenario invite
+./scripts/headless.sh scenario leave
+./scripts/headless.sh replay invite
+./scripts/headless.sh scenario invite build/progress.json
+./scripts/headless.sh inspect build/progress.json
+```
 
-Run `build_release.bat` to create a release build in `build/release`. That exe does not have the hot reloading stuff, since you probably do not want that in the released version of your game. This means that the release version does not use `game.dll`, instead it imports the `source` folder as a normal Odin package.
+Each command prints one JSON observation with the tick, location, active dialogue, available choices, relevant character state, and history length. `scenario invite` shows Hana waiting and Ren delivering the letter; `scenario leave` shows Hana gone and Ren keeping it. `replay` replays the recorded commands and exits unsuccessfully if the resulting observation differs.
 
-`build_debug.bat` is like `build_release.bat` but makes a debuggable executable, in case you need to debug your non-hot-reload-exe.
+## A game in a few calls
 
-## Web build
+The example's public simulation surface is intentionally direct:
 
-`build_web.bat` builds a release web executable (no hot reloading!).
+```odin
+world := unobserved.new_world()
+_ = unobserved.submit(&world, {.Advance_Dialogue})
+_ = unobserved.submit(&world, {.Advance_Dialogue})
+observation := unobserved.observe(&world)
+// observation.choices can be turned into UI, CLI, or agent actions.
+```
 
-### Web build requirements
+`submit` returns an error for invalid commands and changes no state in that case. Reading dialogue never advances time. The two explicit station choices advance to tick 12; the later trip to Ren advances to tick 20. The scheduled tick-10 and tick-12 events run in stable insertion order while the player is at the river.
 
-- Emscripten. Download and install somewhere on your computer. Follow the instructions here: https://emscripten.org/docs/getting_started/downloads.html (follow the stuff under "Installation instructions using the emsdk (recommended)").
-- Recent Odin compiler: This uses Raylib binding changes that were done on January 1, 2025.
+## Save compatibility
 
-### Web build quick start
+Saves are JSON snapshots with a top-level `version` and the complete authoritative `world`, including the logical clock, pending events, stable-order counter, game flags, dialogue position, and command history. Version 1 is the initial experimental format. No compatibility promise is made between versions; a game should reject unsupported versions and migrate deliberately when its state schema changes.
 
-1. Point `EMSCRIPTEN_SDK_DIR` in `build_web.bat/sh` to where you installed emscripten.
-2. Run `build_web.bat/sh`.
-3. Web game is in the `build/web` folder.
+Audio is an external host side effect. Loading a save does not issue gameplay audio commands or replay past sounds; the native host starts its music once and plays a short sound only in response to successful player input.
 
-> [!NOTE]
-> `build_web.bat` is for windows, `build_web.sh` is for Linux / macOS.
+## Layout
 
-> [!WARNING]
-> You can't run `build/web/index.html` directly due to "CORS policy" javascript errors. You can work around that by running a small python web server:
-> - Go to `build/web` in a console.
-> - Run `python -m http.server`
-> - Go to `localhost:8000` in your browser.
->
-> _For those who don't have python: Emscripten comes with it. See the `python` folder in your emscripten installation directory._
+```text
+core/                         Deterministic logical time and history records
+examples/unobserved/game/     Headless world, commands, observations, save/load
+examples/unobserved/main/     Raylib window, input, assets, rendering, audio
+examples/unobserved/assets/   Original generated placeholder art and sounds
+tools/                        Headless scenarios and JSON inspection
+tests/                        Odin tests; no window or raylib initialization
+scripts/                      Native and headless build/run/test entry points
+```
 
-Build a desktop executable using `build_desktop.bat/sh`. It will end up in the `build/desktop` folder.
+The background and portrait illustrations were generated for this example and then resized/cropped for runtime use. The quiet music loop and click sound are locally synthesized test assets.
 
-There's a wrapper for `read_entire_file` and `write_entire_file` from `core:os` that can files from `assets` directory, even on web. See `source/utils.odin`
+## Validation and limitations
 
-### Web build troubleshooting
+The first milestone was built and exercised on macOS arm64 with Odin's bundled raylib 6.0. Headless tests cover event ordering, command replay, offscreen events, dialogue/time separation, save/load, and invalid commands. Native asset loading fails with a nonzero exit when a required asset is missing or invalid.
 
-See the README of the [Odin + Raylib on the web repository](https://github.com/karl-zylinski/odin-raylib-web?tab=readme-ov-file#troubleshooting) for troubleshooting steps.
+Windows and Linux builds, WebAssembly, hot reload, and graphical testing on those platforms remain future validation targets. The narrative is deliberately fixed and small; there is no editor, general scene system, ECS, physics, or scripting language.
 
-## Assets
-You can put assets such as textures, sounds and music in the `assets` folder. That folder will be copied when a release build is created and also integrated into the web build.
+## License and origin
 
-The hot reload build doesn't do any copying, because the hot reload executable lives in the root of the repository, alongside the `assets` folder.
-
-## Sublime Text
-
-For those who use Sublime Text there's a project file: `project.sublime-project`.
-
-How to use:
-- Open the project file in sublime
-- Choose the build system `Main Menu -> Tools -> Build System -> Odin + Raylib + Hot Reload template` (you can rename the build system by editing `project.sublime-project` manually)
-- Compile and run by pressing using F7 / Ctrl + B / Cmd + B
-- After you make code changes and want to hot reload, just hit F7 / Ctrl + B / Cmd + B again
-
-## RAD Debugger
-You can hot reload while attached to [RAD Debugger](https://github.com/EpicGamesExt/raddebugger). Attach to your `game_hot_reload` executable, make code changes in your code editor and re-run the the `build_hot_reload` script to build and hot reload.
-
-## VS Code
-
-You can build, debug and hot reload from within VS Code. Open the template using `File -> Open Folder...`.
-
-Requirements for debugging to work:
-- Windows: [C++ build tools](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools)
-- Linux / Mac: [CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)
-
-<img alt="Image showing  how to start debugging session by selecting Build Hot Reload from the dropdown in the Run and Debug sidebar" src="https://github.com/user-attachments/assets/e62d710b-06f1-4833-bb2a-ab95527cf38c" width="50%" title="Start debugging session by chooing 'Run Hot Reload' and pressing the green arrow button">
-
-Launch with `Run Hot Reload` launch task, see image above. After you make code changes press `Ctrl + Shift + B` to rebuild and hot reload.
-
-## Windows Debugging hacks
-On Windows the degugging while hot reloading works by outputting a new PDB each time the game DLL is built. It cleans up the PDBs when you do a fresh start. See `build_hot_reload.bat` for details.
-
-## Demo streams
-
-Streams that start from this template:
-- 48 hour "Odin Holiday Gamejam": https://www.youtube.com/playlist?list=PLxE7SoPYTef2XC-ObA811vIefj02uSGnB Every minute of the development is documented. The resulting game of the gamejam is here: https://zylinski.itch.io/the-legend-of-tuna
-- CAR RACER prototype: https://www.youtube.com/watch?v=KVbHJ_CLdkA
-- "point & click" prototype: https://www.youtube.com/watch?v=iRvs1Xr1W6o
-- Metroidvania / platform prototype: https://www.youtube.com/watch?v=kIxEMchPc3Y
-- Top-down adventure prototype: https://www.youtube.com/watch?v=cl8EOjOaoXc
-
-## Atlas builder
-
-The template works nicely together with my [atlas builder](https://github.com/karl-zylinski/atlas-builder). The atlas builder can build an atlas texture from a folder of png or aseprite files. Using an atlas can drastically reduce the number of draw calls your game uses. There's an example in that repository on how to set it up. The atlas generation step can easily be integrated into the build `bat` / `sh` files such as `build_hot_reload.bat`
-
-## Questions?
-
-Ask questions in my gamedev Discord: https://discord.gg/4FsHgtBmFK
-
-I have a blog post about Hot Reloading here: http://zylinski.se/posts/hot-reload-gameplay-code/
-
-## Have a nice day! /Karl Zylinski
+Rugops is an experimental open-source project. The initial repository was based on Karl Zylinski's Odin + raylib template; the original license notice is retained in `LICENSE`. Odin and raylib retain their respective licenses in the toolchain distribution.

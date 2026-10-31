@@ -1,7 +1,4 @@
-build/**
-project.sublime-workspace
-game_hot_reload.exe
-game_hot_reload.bin
-game_hot_reload.bin.DSYM
-raylib.dll
-linux/**
+build/
+*.dSYM/
+.DS_Store
+tests/.save-test.json
