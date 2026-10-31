@@ -4,6 +4,8 @@ Rugops is an experimental, Odin-first game foundation built around explicit stat
 
 The engine is intentionally small: `core/` supplies a deterministic integer clock, stable scheduled-event queue, and generic command-history records. `examples/unobserved/game/` owns the game's world, rules, observations, and versioned save format. `examples/unobserved/main/` translates keyboard and mouse input to game commands and renders observations with raylib. No raylib package is imported by the core or the narrative simulation.
 
+`narrative/` is an optional, renderer-independent library for compiling readable dialogue scripts and executing their directed control flow. It does not depend on `core/`, raylib, or a game model. Games provide pure condition queries and receive scene/anchor events; they keep action outcomes, world state, and narrative-map meaning in game code.
+
 ## Requirements
 
 - Odin compiler (the toolchain used for this milestone: `dev-2026-09-nightly:a2fb372`)
@@ -52,6 +54,33 @@ observation := unobserved.observe(&world)
 
 `submit` returns an error for invalid commands and changes no state in that case. Reading dialogue never advances time. The two explicit station choices advance to tick 12; the later trip to Ren advances to tick 20. The tick-10 handler schedules Ren's tick-12 arrival while it runs; `core.advance_to` returns one due event at its own timestamp, allowing the game to handle it and schedule consequences before advancing farther. Calls repeat through the requested target, with stable insertion order for events sharing a timestamp. Scheduling an event earlier than the current logical tick is rejected.
 
+## Optional narrative library
+
+`rugops:narrative` compiles `.stalga`-style source to an indexed `Program`. Authored scene IDs and anchors are stable identities; ordinary dialogue is sequential and has no manually assigned line IDs or next-line pointers. The game supplies a `Registry` of known speakers, actions, and conditions so the compiler can diagnose misspelled symbols and invalid targets.
+
+```odin
+import narrative "rugops:narrative"
+
+compiled := narrative.compile(script_text, game.narrative_symbols())
+defer narrative.destroy_compilation(&compiled)
+if narrative.has_errors(&compiled) {
+	// Report compiled.diagnostics and stop before starting a session.
+}
+
+state := narrative.new_state(&compiled.program)
+for {
+	err := narrative.advance(&compiled.program, &state, game_context,
+		game.query_condition, game.on_narrative_event)
+	if err != .None || state.ended { break }
+	// Render or inspect the node at state.cursor. Continue with
+	// narrative.continue_dialogue, or resolve a visible choice in game code.
+}
+```
+
+`advance` resolves branches, jumps, anchors, and end instructions until it reaches dialogue, narration, or a choice group. Its condition callback is read-only; its event callback reports scene entries and reached anchors. `visible_choice` maps a player-visible option index to the compiled choice. After the game validates and commits the named action, `commit_choice` moves the narrative cursor. The runtime does not advance logical time by itself.
+
+The compiled program owns its source buffer, and its strings refer into that buffer. Keep the `Compilation` alive for as long as its `Program` or runtime state is in use. Runtime instruction positions are compile-local; store stable scene/anchor IDs in saves and resolve them with `cursor_at_anchor` after recompilation. Structural program changes may still require a game-authored save migration.
+
 ## Save compatibility
 
 Saves are JSON snapshots with a top-level `version` and the complete authoritative `world`, including the logical clock, pending events, stable-order counter, game flags, dialogue position, and command history. Version 2 is the current format after the causal scheduler change; version 1 saves are rejected. Loading validates the snapshot by replaying its command history and comparing all authoritative fields, including pending events. No compatibility promise is made between versions; a game should reject unsupported versions and migrate deliberately when its state schema changes.
@@ -62,6 +91,7 @@ Audio is an external host side effect. Loading a save does not issue gameplay au
 
 ```text
 core/                         Deterministic logical time and history records
+narrative/                    Optional text compiler, indexed IR, and interpreter
 examples/unobserved/game/     Headless world, commands, observations, save/load
 examples/unobserved/main/     Raylib window, input, assets, rendering, audio
 examples/unobserved/assets/   Original generated placeholder art and sounds
