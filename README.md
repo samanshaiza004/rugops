@@ -103,6 +103,18 @@ The highest-priority eligible beat wins; equal priorities use ascending beat ID 
 
 `advance` resolves branches, jumps, contextual selections, anchors, and end instructions until it reaches dialogue, narration, or a choice group. `visible_choice` maps a player-visible option ordinal to its current compiled choice. `submit_choice` accepts the program-scoped handle captured from that observation, rechecks eligibility, validates all declared continuations, invokes the game-owned action resolver, and advances the narrative cursor according to its typed outcome. Actions can declare accepted, refused, interrupted, or deferred results; every declared non-accepted outcome needs an explicit `@on` continuation. A game should check that the intended outcome is declared before applying any effects and return errors without mutation. Rugops reports an undeclared outcome but cannot roll back arbitrary game-owned state. The narrative runtime does not advance logical time by itself.
 
+Dialogue and narration nodes may also compile inline performance markup into visible plain text, grapheme-indexed spans, and typed cues. For example:
+
+```text
+@line cafe.rafael.questions_aaron
+Rafael: You [i]thought[/i]? [pause=250ms] Or you [b]knew[/b]?
+Masha: [sfx=paper_rustle]I found the receipt.
+```
+
+`@line` is an optional persistent identity for authored lines used by voice, localization, backlog, or read-state records. Unlabelled lines remain sequential but have no save-stable line identity; use explicit IDs where identity must survive edits. Supported spans are nested `[b]`, `[i]`, `[u]`, `[s]`, and `[color=name]` pairs. `[pause=250ms]`, `[speed=24]...[/speed]`, and `[sfx=asset_key]` compile to cues at Unicode grapheme positions; `[[` and `]]` emit literal brackets. Invalid or mismatched markup reports its source line and column. `Node.text` is the display-ready text, while `Node.text_span_start/count` and `Node.presentation_cue_start/count` index arrays owned by the compiled `Program`.
+
+`rugops:presentation` is an optional, renderer-independent protocol for the host. `Stage_State` represents persistent composition (background, soundtrack intent, and ordered character portraits); `Presentation_Impulse` represents drain-once external effects such as sound. Host-driven integer presentation milliseconds advance a transition without reading wall time or changing game time. `Noop_Presenter` consumes cues for headless execution. Asset IDs are logical names and host-owned resources such as Raylib textures and sounds never enter this package.
+
 ## Bounded state exploration
 
 `rugops:core` includes a deterministic breadth-first explorer for finding real command sequences through a game. The game supplies callbacks to clone and destroy states, enumerate legal commands, apply a command to a clone, test a goal, hash state, and compare future-equivalent state. Commands remain opaque to Rugops and are returned as a witness in the same order used during exploration.

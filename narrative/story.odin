@@ -156,6 +156,42 @@ Node_Kind :: enum u8 {
 	End,
 }
 
+// Rich text syntax in source uses paired [b], [i], [u], [s], and
+// [color=semantic_name] tags. [pause=250ms] and [sfx=stable_key] add cues at
+// their source position; [speed=24]...[/speed] changes reveal speed for a
+// span and restores the previous speed at its end. Double brackets ([[ and ]])
+// produce literal brackets. Compilation strips tags into plain visible text
+// plus grapheme-indexed spans and cues, leaving rendering to the host.
+Text_Style :: enum u8 {
+	Bold,
+	Italic,
+	Underline,
+	Strike,
+	Color,
+}
+
+Text_Span :: struct {
+	start: int,
+	end:   int,
+	depth: int, // Outer spans have smaller depth than nested spans.
+	style: Text_Style,
+	value: string, // Used by semantic styles such as Color; otherwise empty.
+}
+
+Presentation_Cue_Kind :: enum u8 {
+	Pause,
+	Speed,
+	Sound_Effect,
+}
+
+Presentation_Cue :: struct {
+	position:   int, // Grapheme index in the owning Node.text.
+	kind:       Presentation_Cue_Kind,
+	duration_ms: int, // Pause duration; zero for other cue kinds.
+	speed:      int, // Graphemes per second; zero restores host default.
+	value:      string, // Sound-effect key; empty for pause/speed.
+}
+
 Scene :: struct {
 	id:       string,
 	title:    string,
@@ -181,6 +217,11 @@ Node :: struct {
 	anchor_id:     string,
 	checkpoint:    bool,
 	line:          int,
+	line_id:       string, // Stable only when authored with @line; otherwise empty.
+	text_span_start: int,
+	text_span_count: int,
+	presentation_cue_start: int,
+	presentation_cue_count: int,
 }
 
 Selection_Policy :: enum u8 {
@@ -287,6 +328,7 @@ Program :: struct {
 	identity: Program_Identity,
 	identity_id_storage: []u8,
 	query_string_storage: [dynamic][]u8,
+	rich_text_string_storage: [dynamic][]u8,
 	query_fields: [dynamic]Field_Definition,
 	scenes:  [dynamic]Scene,
 	nodes:   [dynamic]Node,
@@ -298,6 +340,8 @@ Program :: struct {
 	edges:   [dynamic]Edge,
 	query_nodes: [dynamic]Query_Node,
 	queries: [dynamic]Query_Expression,
+	text_spans: [dynamic]Text_Span,
+	presentation_cues: [dynamic]Presentation_Cue,
 	entry_scene: int,
 }
 
@@ -331,6 +375,10 @@ Diagnostic_Code :: enum u8 {
 	Duplicate_Selection_Beat,
 	Invalid_Selection,
 	Missing_Selection_Fallback,
+	Invalid_Line_ID,
+	Duplicate_Line_ID,
+	Misplaced_Line_ID,
+	Malformed_Rich_Text,
 }
 
 Diagnostic :: struct {
@@ -358,6 +406,8 @@ destroy_program :: proc(program: ^Program) {
 	delete(program.identity_id_storage)
 	for value in program.query_string_storage { delete(value) }
 	delete(program.query_string_storage)
+	for value in program.rich_text_string_storage { delete(value) }
+	delete(program.rich_text_string_storage)
 	for field in program.query_fields {
 		delete(field.enum_values)
 		delete(field.reads)
@@ -373,6 +423,8 @@ destroy_program :: proc(program: ^Program) {
 	delete(program.edges)
 	delete(program.query_nodes)
 	delete(program.queries)
+	delete(program.text_spans)
+	delete(program.presentation_cues)
 	program^ = {}
 }
 

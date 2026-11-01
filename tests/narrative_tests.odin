@@ -549,6 +549,92 @@ narrative_compiler_requires_routes_for_declared_refusal_and_interruption :: proc
 	assert(!narrative.has_errors(&compiled_interrupted))
 }
 
+@(test)
+narrative_compiler_builds_grapheme_indexed_rich_text_and_cues :: proc(t: ^testing.T) {
+	_ = t
+	source := `:: opening
+@line opening.greeting
+Narrator: [pause=50ms][speed=24][sfx=page_turn]Café [pause=180ms][b]bold [i]nested[/i][/b] ending[/speed]
+@end
+`
+	compiled := narrative.compile(source, narrative_test_registry())
+	defer narrative.destroy_compilation(&compiled)
+	assert(!narrative.has_errors(&compiled))
+	assert(len(compiled.program.nodes) == 2)
+	node := compiled.program.nodes[0]
+	assert(node.line_id == "opening.greeting")
+	assert(node.text == "Café bold nested ending")
+	assert(node.text_span_count == 2)
+	spans := compiled.program.text_spans[node.text_span_start:node.text_span_start+node.text_span_count]
+	// Outer spans precede their nested spans, and offsets count the decomposed
+	// e + combining mark as one user-visible grapheme.
+	assert(spans[0].style == .Bold && spans[0].start == 5 && spans[0].end == 16 && spans[0].depth == 0)
+	assert(spans[1].style == .Italic && spans[1].start == 10 && spans[1].end == 16 && spans[1].depth == 1)
+	assert(node.presentation_cue_count == 5)
+	cues := compiled.program.presentation_cues[node.presentation_cue_start:node.presentation_cue_start+node.presentation_cue_count]
+	assert(cues[0].kind == .Pause && cues[0].position == 0 && cues[0].duration_ms == 50)
+	assert(cues[1].kind == .Speed && cues[1].position == 0 && cues[1].speed == 24)
+	assert(cues[2].kind == .Sound_Effect && cues[2].position == 0 && cues[2].value == "page_turn")
+	assert(cues[3].kind == .Pause && cues[3].position == 5 && cues[3].duration_ms == 180)
+	assert(cues[4].kind == .Speed && cues[4].position == 23 && cues[4].speed == 0)
+}
+
+@(test)
+narrative_compiler_preserves_explicit_line_ids_across_prose_edits :: proc(t: ^testing.T) {
+	_ = t
+	first := narrative.compile(`:: opening
+@line opening.answer
+Narrator: The first wording.
+Narrator: An unlabelled line.
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&first)
+	second := narrative.compile(`:: opening
+@line opening.answer
+Narrator: A much longer replacement sentence, with different words.
+Narrator: An unlabelled line.
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&second)
+	assert(!narrative.has_errors(&first) && !narrative.has_errors(&second))
+	assert(first.program.nodes[0].line_id == second.program.nodes[0].line_id)
+	assert(first.program.nodes[0].line_id == "opening.answer")
+	assert(first.program.nodes[1].line_id == "" && second.program.nodes[1].line_id == "")
+	duplicate := narrative.compile(`:: opening
+@line repeated
+Narrator: First.
+@line repeated
+Narrator: Second.
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&duplicate)
+	assert(has_diagnostic(&duplicate, .Duplicate_Line_ID))
+}
+
+@(test)
+narrative_compiler_reports_malformed_rich_text_with_source_location :: proc(t: ^testing.T) {
+	_ = t
+	compiled := narrative.compile(`:: opening
+Narrator: A malformed [/i] tag.
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&compiled)
+	assert(narrative.has_errors(&compiled))
+	found_location := false
+	for diagnostic in compiled.diagnostics {
+		if diagnostic.code == .Malformed_Rich_Text && diagnostic.line == 2 && diagnostic.column > 1 {
+			found_location = true
+		}
+	}
+	assert(found_location)
+	valid_bad_tag := narrative.compile(`:: opening
+Narrator: [mystery] tag.
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&valid_bad_tag)
+	assert(has_diagnostic(&valid_bad_tag, .Malformed_Rich_Text))
+}
+
 has_diagnostic :: proc(compiled: ^narrative.Compilation, code: narrative.Diagnostic_Code) -> bool {
 	for diagnostic in compiled.diagnostics {
 		if diagnostic.code == code { return true }

@@ -1,6 +1,7 @@
 package narrative
 
 import "core:strings"
+import "core:unicode/utf8"
 
 ACTION_OUTCOMES :: [4]Action_Outcome{.Accepted, .Refused, .Interrupted, .Deferred}
 
@@ -40,6 +41,9 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 	choice_condition_index := -1
 	choice_condition_not := false
 	selection_pool_index := -1
+	pending_line_id := ""
+	pending_line_id_line := 0
+	pending_line_id_column := 0
 	branch_stack: [dynamic]int
 	branch_else_jumps: [dynamic]int
 	for raw_line, line_index in lines {
@@ -47,12 +51,20 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 		indent := indentation(raw_line)
 		line := strings.trim_space(raw_line)
 		if line == "" || strings.has_prefix(line, "//") { continue }
+		if pending_line_id != "" && (strings.has_prefix(line, ":: ") || strings.has_prefix(line, "?") || strings.has_prefix(line, "- ") || strings.has_prefix(line, "@") || strings.has_prefix(line, "-> ")) {
+			diagnose(&result, .Misplaced_Line_ID, pending_line_id_line, pending_line_id_column, pending_line_id)
+			pending_line_id = ""
+		}
 		if strings.has_prefix(line, ":: ") {
 			if selection_pool_index >= 0 {
 				diagnose(&result, .Invalid_Selection, line_no, 1, "@select must end with @endselect")
 				selection_pool_index = -1
 			}
 			id := strings.trim_space(line[3:])
+			if pending_line_id != "" {
+				diagnose(&result, .Misplaced_Line_ID, pending_line_id_line, pending_line_id_column, pending_line_id)
+				pending_line_id = ""
+			}
 			if !valid_id(id) {
 				diagnose(&result, .Invalid_ID, line_no, 4, id)
 				continue
@@ -74,6 +86,30 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 		}
 		if current_scene < 0 {
 			diagnose(&result, .Syntax, line_no, 1, "expected a :: scene declaration")
+			continue
+		}
+		if line == "@line" || strings.has_prefix(line, "@line ") {
+			id := ""
+			if len(line) > len("@line") { id = strings.trim_space(line[len("@line "):]) }
+			if pending_line_id != "" {
+				diagnose(&result, .Misplaced_Line_ID, pending_line_id_line, pending_line_id_column, pending_line_id)
+				pending_line_id = ""
+			}
+			if !valid_id(id) {
+				diagnose(&result, .Invalid_Line_ID, line_no, indent+7, id)
+				continue
+			}
+			duplicate := false
+			for node in result.program.nodes {
+				if node.line_id == id { duplicate = true; break }
+			}
+			if duplicate {
+				diagnose(&result, .Duplicate_Line_ID, line_no, indent+7, id)
+				continue
+			}
+			pending_line_id = id
+			pending_line_id_line = line_no
+			pending_line_id_column = indent + 1
 			continue
 		}
 		if selection_pool_index >= 0 && !strings.has_prefix(line, "@beat ") && !strings.has_prefix(line, "@fallback ") && line != "@endselect" {
@@ -359,10 +395,37 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 			if !registry_has_speaker(registry, speaker) {
 				diagnose(&result, .Unknown_Speaker, line_no, indent+1, speaker)
 			}
-			append(&result.program.nodes, Node{kind = .Dialogue, speaker = speaker, text = strings.trim_space(line[colon+1:]), line = line_no})
+			body_start := colon + 1
+			for body_start < len(line) && (line[body_start] == ' ' || line[body_start] == '\t') { body_start += 1 }
+			text, span_start, span_count, cue_start, cue_count := compile_rich_text(&result, line[body_start:], line_no, indent+body_start+1)
+			append(&result.program.nodes, Node{
+				kind = .Dialogue,
+				speaker = speaker,
+				text = text,
+				line = line_no,
+				line_id = own_rich_text_string(&result, pending_line_id),
+				text_span_start = span_start,
+				text_span_count = span_count,
+				presentation_cue_start = cue_start,
+				presentation_cue_count = cue_count,
+			})
 		} else {
-			append(&result.program.nodes, Node{kind = .Narration, text = line, line = line_no})
+			text, span_start, span_count, cue_start, cue_count := compile_rich_text(&result, line, line_no, indent+1)
+			append(&result.program.nodes, Node{
+				kind = .Narration,
+				text = text,
+				line = line_no,
+				line_id = own_rich_text_string(&result, pending_line_id),
+				text_span_start = span_start,
+				text_span_count = span_count,
+				presentation_cue_start = cue_start,
+				presentation_cue_count = cue_count,
+			})
 		}
+		pending_line_id = ""
+	}
+	if pending_line_id != "" {
+		diagnose(&result, .Misplaced_Line_ID, pending_line_id_line, pending_line_id_column, pending_line_id)
 	}
 	if current_scene >= 0 { result.program.scenes[current_scene].end = len(result.program.nodes) }
 	for index in branch_stack {
@@ -378,6 +441,208 @@ compile :: proc(source: string, registry: Registry, metadata: Program_Metadata =
 	build_edges(&result.program)
 	validate_reachability(&result)
 	return result
+}
+
+Rich_Byte_Span :: struct {
+	start: int,
+	end: int,
+	depth: int,
+	style: Text_Style,
+	value: string,
+}
+
+Rich_Byte_Cue :: struct {
+	position: int,
+	kind: Presentation_Cue_Kind,
+	duration_ms: int,
+	speed: int,
+	value: string,
+}
+
+Rich_Text_Frame :: struct {
+	tag: string,
+	style: Text_Style,
+	value: string,
+	start_byte: int,
+	depth: int,
+	speed_frame: bool,
+	previous_speed: int,
+	line: int,
+	column: int,
+}
+
+// compile_rich_text strips semantic tags into an indexed representation. It
+// records temporary byte positions first, then converts them against the final
+// visible string to Unicode grapheme positions.
+compile_rich_text :: proc(result: ^Compilation, source_text: string, line, base_column: int) -> (text: string, span_start, span_count, cue_start, cue_count: int) {
+	plain := make([]u8, len(source_text))
+	plain_len := 0
+	byte_spans: [dynamic]Rich_Byte_Span
+	byte_cues: [dynamic]Rich_Byte_Cue
+	frames: [dynamic]Rich_Text_Frame
+	defer delete(byte_spans)
+	defer delete(byte_cues)
+	defer delete(frames)
+	span_start = len(result.program.text_spans)
+	cue_start = len(result.program.presentation_cues)
+	current_speed := 0
+	position := 0
+	for position < len(source_text) {
+		if source_text[position] == '[' {
+			if position+1 < len(source_text) && source_text[position+1] == '[' {
+				plain[plain_len] = '['
+				plain_len += 1
+				position += 2
+				continue
+			}
+			close_offset := index_of(source_text[position+1:], "]")
+			if close_offset >= 0 {
+				tag_end := position + 1 + close_offset
+				tag := source_text[position+1:tag_end]
+				column := base_column + position
+				if strings.has_prefix(tag, "pause=") {
+					value := tag[len("pause="):]
+					if !strings.has_suffix(value, "ms") {
+						diagnose(result, .Malformed_Rich_Text, line, column, "pause requires milliseconds, e.g. [pause=250ms]")
+					} else {
+						duration, ok := parse_i64(value[:len(value)-2])
+						if !ok || duration <= 0 || duration > 600_000 {
+							diagnose(result, .Malformed_Rich_Text, line, column, "pause duration must be between 1ms and 600000ms")
+						} else {
+							append(&byte_cues, Rich_Byte_Cue{position = plain_len, kind = .Pause, duration_ms = int(duration)})
+						}
+					}
+					position = tag_end + 1
+					continue
+				}
+				if strings.has_prefix(tag, "sfx=") {
+					key := tag[len("sfx="):]
+					if !valid_id(key) {
+						diagnose(result, .Malformed_Rich_Text, line, column, "sound cue requires a stable key, e.g. [sfx=paper_rustle]")
+					} else {
+						append(&byte_cues, Rich_Byte_Cue{position = plain_len, kind = .Sound_Effect, value = key})
+					}
+					position = tag_end + 1
+					continue
+				}
+				if strings.has_prefix(tag, "speed=") {
+					speed_value, ok := parse_i64(tag[len("speed="):])
+					if !ok || speed_value <= 0 || speed_value > 1000 {
+						diagnose(result, .Malformed_Rich_Text, line, column, "speed must be between 1 and 1000 graphemes per second")
+					} else {
+						speed := int(speed_value)
+						append(&byte_cues, Rich_Byte_Cue{position = plain_len, kind = .Speed, speed = speed})
+						append(&frames, Rich_Text_Frame{tag = "speed", start_byte = plain_len, speed_frame = true, previous_speed = current_speed, line = line, column = column})
+						current_speed = speed
+					}
+					position = tag_end + 1
+					continue
+				}
+				if strings.has_prefix(tag, "/") {
+					closing := tag[1:]
+					if len(frames) == 0 || frames[len(frames)-1].tag != closing {
+						diagnose(result, .Malformed_Rich_Text, line, column, "rich-text tags must close in nested order")
+					} else {
+						frame := pop(&frames)
+						if frame.speed_frame {
+							append(&byte_cues, Rich_Byte_Cue{position = plain_len, kind = .Speed, speed = frame.previous_speed})
+							current_speed = frame.previous_speed
+						} else {
+							append(&byte_spans, Rich_Byte_Span{start = frame.start_byte, end = plain_len, depth = frame.depth, style = frame.style, value = frame.value})
+						}
+					}
+					position = tag_end + 1
+					continue
+				}
+				style, value, is_style := parse_text_style(tag)
+				if is_style {
+					style_tag := tag
+					if style == .Color { style_tag = "color" }
+					style_depth := 0
+					for frame in frames { if !frame.speed_frame { style_depth += 1 } }
+					append(&frames, Rich_Text_Frame{tag = style_tag, style = style, value = value, start_byte = plain_len, depth = style_depth, line = line, column = column})
+					position = tag_end + 1
+					continue
+				}
+				diagnose(result, .Malformed_Rich_Text, line, column, "unknown rich-text tag")
+				for copy_index := position; copy_index <= tag_end; copy_index += 1 {
+					plain[plain_len] = source_text[copy_index]
+					plain_len += 1
+				}
+				position = tag_end + 1
+				continue
+			}
+			diagnose(result, .Malformed_Rich_Text, line, base_column+position, "unclosed '[' in rich text; use '[[' for a literal bracket")
+		}
+		if source_text[position] == ']' && position+1 < len(source_text) && source_text[position+1] == ']' {
+			plain[plain_len] = ']'
+			plain_len += 1
+			position += 2
+			continue
+		}
+		plain[plain_len] = source_text[position]
+		plain_len += 1
+		position += 1
+	}
+	for frame in frames {
+		diagnose(result, .Malformed_Rich_Text, frame.line, frame.column, "unclosed rich-text tag")
+	}
+	plain_text := string(plain[:plain_len])
+	text = own_rich_text_string(result, plain_text)
+	// Present spans in source nesting order so a host can apply outer semantic
+	// styles before nested overrides. Equal ranges remain in stable source order.
+	for i := 1; i < len(byte_spans); i += 1 {
+		span := byte_spans[i]
+		j := i
+		for j > 0 {
+			previous := byte_spans[j-1]
+			if previous.start < span.start || (previous.start == span.start && previous.depth <= span.depth) { break }
+			byte_spans[j] = previous
+			j -= 1
+		}
+		byte_spans[j] = span
+	}
+	for span in byte_spans {
+		start, _, _ := utf8.grapheme_count(plain_text[:span.start])
+		end, _, _ := utf8.grapheme_count(plain_text[:span.end])
+		append(&result.program.text_spans, Text_Span{start = start, end = end, depth = span.depth, style = span.style, value = own_rich_text_string(result, span.value)})
+	}
+	for cue in byte_cues {
+		grapheme_position, _, _ := utf8.grapheme_count(plain_text[:cue.position])
+		append(&result.program.presentation_cues, Presentation_Cue{
+			position = grapheme_position,
+			kind = cue.kind,
+			duration_ms = cue.duration_ms,
+			speed = cue.speed,
+			value = own_rich_text_string(result, cue.value),
+		})
+	}
+	span_count = len(result.program.text_spans) - span_start
+	cue_count = len(result.program.presentation_cues) - cue_start
+	delete(plain)
+	return
+}
+
+parse_text_style :: proc(tag: string) -> (style: Text_Style, value: string, ok: bool) {
+	switch tag {
+	case "b": return .Bold, "", true
+	case "i": return .Italic, "", true
+	case "u": return .Underline, "", true
+	case "s": return .Strike, "", true
+	}
+	if strings.has_prefix(tag, "color=") {
+		value = tag[len("color="):]
+		return .Color, value, valid_id(value)
+	}
+	return .Bold, "", false
+}
+
+own_rich_text_string :: proc(result: ^Compilation, value: string) -> string {
+	if value == "" { return "" }
+	bytes := make([]u8, len(value), context.allocator)
+	copy(bytes, transmute([]u8)value)
+	append(&result.program.rich_text_string_storage, bytes)
+	return string(bytes)
 }
 
 copy_query_schema :: proc(result: ^Compilation, registry: Registry) {
