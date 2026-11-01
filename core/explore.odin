@@ -96,8 +96,10 @@ Explore_Search_Node :: struct {
 // State hashes only narrow equality checks: matching hashes are always
 // confirmed with states_equal. A witness contains commands from the initial
 // state to the first goal found, with shortest length and stable command-order
-// tie-breaking. Set closed_finite only when command enumeration is complete
-// and the reachable future-relevant state space is known to be finite.
+// tie-breaking. For safety checks, is_goal can mean "this state violates the
+// property"; a reachable result is then a replayable counterexample. Set
+// closed_finite only when command enumeration is complete and the reachable
+// future-relevant state space is known to be finite.
 explore :: proc(request: Explore_Request) -> Explore_Result {
 	result := Explore_Result{status = .Failed}
 	if request.initial_state == nil || request.clone_state == nil || request.destroy_state == nil ||
