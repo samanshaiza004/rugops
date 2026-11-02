@@ -449,6 +449,7 @@ Rich_Byte_Span :: struct {
 	depth: int,
 	style: Text_Style,
 	value: string,
+	opacity_percent: u8,
 }
 
 Rich_Byte_Cue :: struct {
@@ -463,6 +464,7 @@ Rich_Text_Frame :: struct {
 	tag: string,
 	style: Text_Style,
 	value: string,
+	opacity_percent: u8,
 	start_byte: int,
 	depth: int,
 	speed_frame: bool,
@@ -548,23 +550,44 @@ compile_rich_text :: proc(result: ^Compilation, source_text: string, line, base_
 							append(&byte_cues, Rich_Byte_Cue{position = plain_len, kind = .Speed, speed = frame.previous_speed})
 							current_speed = frame.previous_speed
 						} else {
-							append(&byte_spans, Rich_Byte_Span{start = frame.start_byte, end = plain_len, depth = frame.depth, style = frame.style, value = frame.value})
+							append(&byte_spans, Rich_Byte_Span{
+								start = frame.start_byte,
+								end = plain_len,
+								depth = frame.depth,
+								style = frame.style,
+								value = frame.value,
+								opacity_percent = frame.opacity_percent,
+							})
 						}
 					}
 					position = tag_end + 1
 					continue
 				}
-				style, value, is_style := parse_text_style(tag)
+				style, value, opacity_percent, is_style := parse_text_style(tag)
 				if is_style {
 					style_tag := tag
 					if style == .Color { style_tag = "color" }
+					if style == .Opacity { style_tag = "opacity" }
 					style_depth := 0
 					for frame in frames { if !frame.speed_frame { style_depth += 1 } }
-					append(&frames, Rich_Text_Frame{tag = style_tag, style = style, value = value, start_byte = plain_len, depth = style_depth, line = line, column = column})
+					append(&frames, Rich_Text_Frame{
+						tag = style_tag,
+						style = style,
+						value = value,
+						opacity_percent = opacity_percent,
+						start_byte = plain_len,
+						depth = style_depth,
+						line = line,
+						column = column,
+					})
 					position = tag_end + 1
 					continue
 				}
-				diagnose(result, .Malformed_Rich_Text, line, column, "unknown rich-text tag")
+				diagnostic_message := "unknown rich-text tag"
+				if strings.has_prefix(tag, "opacity=") {
+					diagnostic_message = "opacity must be an integer from 0 through 100"
+				}
+				diagnose(result, .Malformed_Rich_Text, line, column, diagnostic_message)
 				for copy_index := position; copy_index <= tag_end; copy_index += 1 {
 					plain[plain_len] = source_text[copy_index]
 					plain_len += 1
@@ -605,7 +628,14 @@ compile_rich_text :: proc(result: ^Compilation, source_text: string, line, base_
 	for span in byte_spans {
 		start, _, _ := utf8.grapheme_count(plain_text[:span.start])
 		end, _, _ := utf8.grapheme_count(plain_text[:span.end])
-		append(&result.program.text_spans, Text_Span{start = start, end = end, depth = span.depth, style = span.style, value = own_rich_text_string(result, span.value)})
+		append(&result.program.text_spans, Text_Span{
+			start = start,
+			end = end,
+			depth = span.depth,
+			style = span.style,
+			value = own_rich_text_string(result, span.value),
+			opacity_percent = span.opacity_percent,
+		})
 	}
 	for cue in byte_cues {
 		grapheme_position, _, _ := utf8.grapheme_count(plain_text[:cue.position])
@@ -623,18 +653,25 @@ compile_rich_text :: proc(result: ^Compilation, source_text: string, line, base_
 	return
 }
 
-parse_text_style :: proc(tag: string) -> (style: Text_Style, value: string, ok: bool) {
+parse_text_style :: proc(tag: string) -> (style: Text_Style, value: string, opacity_percent: u8, ok: bool) {
 	switch tag {
-	case "b": return .Bold, "", true
-	case "i": return .Italic, "", true
-	case "u": return .Underline, "", true
-	case "s": return .Strike, "", true
+	case "b": return .Bold, "", 100, true
+	case "i": return .Italic, "", 100, true
+	case "u": return .Underline, "", 100, true
+	case "s": return .Strike, "", 100, true
 	}
 	if strings.has_prefix(tag, "color=") {
 		value = tag[len("color="):]
-		return .Color, value, valid_id(value)
+		return .Color, value, 100, valid_id(value)
 	}
-	return .Bold, "", false
+	if strings.has_prefix(tag, "opacity=") {
+		parsed, valid := parse_i64(tag[len("opacity="):])
+		if !valid || parsed < 0 || parsed > 100 {
+			return .Opacity, "", 0, false
+		}
+		return .Opacity, "", u8(parsed), true
+	}
+	return .Bold, "", 100, false
 }
 
 own_rich_text_string :: proc(result: ^Compilation, value: string) -> string {

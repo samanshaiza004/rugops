@@ -633,6 +633,30 @@ Narrator: [mystery] tag.
 `, narrative_test_registry())
 	defer narrative.destroy_compilation(&valid_bad_tag)
 	assert(has_diagnostic(&valid_bad_tag, .Malformed_Rich_Text))
+	invalid_opacity := narrative.compile(`:: opening
+Narrator: [opacity=101]Too opaque.[/opacity]
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&invalid_opacity)
+	assert(has_diagnostic(&invalid_opacity, .Malformed_Rich_Text))
+}
+
+@(test)
+narrative_compiler_preserves_typed_opacity_spans :: proc(t: ^testing.T) {
+	_ = t
+	compiled := narrative.compile(`:: opening
+Narrator: Before [opacity=65][i]a softer phrase[/i][/opacity] after.
+@end
+`, narrative_test_registry())
+	defer narrative.destroy_compilation(&compiled)
+	assert(!narrative.has_errors(&compiled))
+	node := compiled.program.nodes[0]
+	assert(node.text == "Before a softer phrase after.")
+	spans := compiled.program.text_spans[node.text_span_start:node.text_span_start+node.text_span_count]
+	assert(len(spans) == 2)
+	assert(spans[0].style == .Opacity && spans[0].start == 7 && spans[0].end == 22)
+	assert(spans[0].opacity_percent == 65)
+	assert(spans[1].style == .Italic && spans[1].opacity_percent == 100)
 }
 
 has_diagnostic :: proc(compiled: ^narrative.Compilation, code: narrative.Diagnostic_Code) -> bool {

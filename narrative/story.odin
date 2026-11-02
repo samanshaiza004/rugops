@@ -156,18 +156,19 @@ Node_Kind :: enum u8 {
 	End,
 }
 
-// Rich text syntax in source uses paired [b], [i], [u], [s], and
-// [color=semantic_name] tags. [pause=250ms] and [sfx=stable_key] add cues at
-// their source position; [speed=24]...[/speed] changes reveal speed for a
-// span and restores the previous speed at its end. Double brackets ([[ and ]])
-// produce literal brackets. Compilation strips tags into plain visible text
-// plus grapheme-indexed spans and cues, leaving rendering to the host.
+// Rich text syntax in source uses paired [b], [i], [u], [s], [color=name], and
+// [opacity=percent] tags. [pause=250ms] and [sfx=stable_key] add cues at their
+// source position; [speed=24]...[/speed] changes reveal speed for a span and
+// restores the previous speed at its end. Double brackets ([[ and ]]) produce
+// literal brackets. Compilation strips tags into plain visible text plus
+// grapheme-indexed spans and cues, leaving rendering to the host.
 Text_Style :: enum u8 {
 	Bold,
 	Italic,
 	Underline,
 	Strike,
 	Color,
+	Opacity,
 }
 
 Text_Span :: struct {
@@ -176,6 +177,7 @@ Text_Span :: struct {
 	depth: int, // Outer spans have smaller depth than nested spans.
 	style: Text_Style,
 	value: string, // Used by semantic styles such as Color; otherwise empty.
+	opacity_percent: u8, // Used by opacity spans, from 0 (transparent) to 100.
 }
 
 Presentation_Cue_Kind :: enum u8 {
